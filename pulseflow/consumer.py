@@ -3,7 +3,7 @@ from pathlib import Path
 import json
 import sqlite3
 
-from .values import Conflict, canonical, integer
+from .values import Conflict, Invalid, Missing, canonical, integer, utc_now
 
 
 DDL = """
@@ -27,6 +27,24 @@ CREATE TABLE IF NOT EXISTS applied_changes (
  source_sequence INTEGER NOT NULL,
  fingerprint TEXT NOT NULL,
  PRIMARY KEY(subscription,source_sequence)
+);
+CREATE TABLE IF NOT EXISTS switch_ledger (
+ subscription TEXT NOT NULL,
+ release_id TEXT NOT NULL,
+ version INTEGER NOT NULL,
+ pipeline TEXT NOT NULL,
+ plan_hash TEXT NOT NULL,
+ change_head INTEGER NOT NULL,
+ PRIMARY KEY(subscription,release_id)
+);
+CREATE TABLE IF NOT EXISTS binding_history (
+ subscription TEXT NOT NULL,
+ sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+ release_id TEXT,
+ pipeline TEXT NOT NULL,
+ plan_hash TEXT NOT NULL,
+ cursor INTEGER NOT NULL,
+ switched_at TEXT NOT NULL
 );
 """
 
@@ -164,6 +182,158 @@ class Consumer:
                 "UPDATE subscriptions SET cursor=? WHERE name=?", (head, name)
             )
         return {"subscription": name, "cursor": head, "rows": len(rows)}
+
+    def _verify_descriptor(self, source, descriptor):
+        """Validate a release descriptor against the live source catalog."""
+        if not isinstance(descriptor, dict) or descriptor.get("format_version") != 1:
+            raise Invalid("unsupported release descriptor")
+        required = {
+            "format_version",
+            "origin",
+            "logical_name",
+            "release_id",
+            "version",
+            "pipeline",
+            "plan_hash",
+            "channel",
+            "cutoff_sequence",
+            "source_prefix_sha256",
+            "change_head",
+            "rows",
+        }
+        if set(descriptor) < required:
+            raise Invalid("release descriptor is missing fields")
+        if descriptor["origin"] != source.catalog.identity():
+            raise Conflict("release belongs to a different source instance")
+        integer(descriptor["version"], "release version", 1)
+        integer(descriptor["change_head"], "release change head", 0)
+        integer(descriptor["cutoff_sequence"], "release cutoff", 0)
+        with source.catalog.transaction() as connection:
+            info = source.catalog.pipeline(descriptor["pipeline"], connection)
+            if info["plan_hash"] != descriptor["plan_hash"]:
+                raise Conflict("release plan fingerprint does not match the pipeline")
+            head = source.results.head(descriptor["pipeline"], connection)
+            if head < descriptor["change_head"]:
+                raise Conflict("source changelog moved behind the release cursor")
+            actual_prefix = source.journal.digest_prefix(
+                connection, descriptor["channel"], descriptor["cutoff_sequence"]
+            )
+        if actual_prefix != descriptor["source_prefix_sha256"]:
+            raise Conflict("release source prefix fingerprint does not match")
+        return descriptor
+
+    def promote(self, source, descriptor, name="default"):
+        """Switch one subscription onto a published release.
+
+        The whole materialized result is replaced inside a single transaction
+        and the cursor is reset to the release changelog position, so no old
+        entry can survive, no appended event is lost and no change is applied
+        twice. Repeating the same release is a no-op; an older release is
+        rejected once a newer one has been applied.
+        """
+        descriptor = self._verify_descriptor(source, descriptor)
+        with self.transaction() as destination:
+            subscription = destination.execute(
+                "SELECT * FROM subscriptions WHERE name=?", (name,)
+            ).fetchone()
+            if subscription is None:
+                raise Missing("subscription does not exist; consume a pipeline first")
+            if subscription["origin"] != descriptor["origin"]:
+                raise Conflict("subscription belongs to a different source")
+            prior = destination.execute(
+                "SELECT max(version) AS version FROM switch_ledger WHERE subscription=?",
+                (name,),
+            ).fetchone()
+            if prior["version"] is not None:
+                if descriptor["version"] < prior["version"]:
+                    raise Conflict(
+                        "stale release cannot replace a newer applied version"
+                    )
+                already = destination.execute(
+                    "SELECT 1 FROM switch_ledger WHERE subscription=? AND release_id=?",
+                    (name, descriptor["release_id"]),
+                ).fetchone()
+                if already:
+                    return {
+                        "subscription": name,
+                        "release_id": descriptor["release_id"],
+                        "version": descriptor["version"],
+                        "replayed": True,
+                        "rows": destination.execute(
+                            "SELECT count(*) FROM materialized WHERE subscription=?",
+                            (name,),
+                        ).fetchone()[0],
+                        "cursor": subscription["cursor"],
+                    }
+            destination.execute(
+                "DELETE FROM materialized WHERE subscription=?", (name,)
+            )
+            destination.execute(
+                "DELETE FROM applied_changes WHERE subscription=?", (name,)
+            )
+            destination.executemany(
+                "INSERT INTO materialized VALUES (?,?,?,?,?)",
+                (
+                    (
+                        name,
+                        row["result_key"],
+                        integer(row["revision"], "release result revision", 1),
+                        canonical(row["document"]),
+                        int(bool(row["deleted"])),
+                    )
+                    for row in descriptor["rows"]
+                ),
+            )
+            cursor = descriptor["change_head"]
+            destination.execute(
+                "UPDATE subscriptions SET pipeline=?,plan_hash=?,cursor=? WHERE name=?",
+                (
+                    descriptor["pipeline"],
+                    descriptor["plan_hash"],
+                    cursor,
+                    name,
+                ),
+            )
+            destination.execute(
+                "INSERT INTO switch_ledger VALUES (?,?,?,?,?,?)",
+                (
+                    name,
+                    descriptor["release_id"],
+                    descriptor["version"],
+                    descriptor["pipeline"],
+                    descriptor["plan_hash"],
+                    cursor,
+                ),
+            )
+            destination.execute(
+                "INSERT INTO binding_history"
+                "(subscription,release_id,pipeline,plan_hash,cursor,switched_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    name,
+                    descriptor["release_id"],
+                    descriptor["pipeline"],
+                    descriptor["plan_hash"],
+                    cursor,
+                    utc_now(),
+                ),
+            )
+        return {
+            "subscription": name,
+            "release_id": descriptor["release_id"],
+            "version": descriptor["version"],
+            "replayed": False,
+            "rows": len(descriptor["rows"]),
+            "cursor": cursor,
+        }
+
+    def switches(self, name="default"):
+        with self.transaction() as connection:
+            rows = connection.execute(
+                "SELECT * FROM binding_history WHERE subscription=? ORDER BY sequence",
+                (name,),
+            )
+            return [dict(row) for row in rows]
 
     def rows(self, name="default", include_deleted=False):
         with self.transaction() as connection:

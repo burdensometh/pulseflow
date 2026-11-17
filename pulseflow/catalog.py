@@ -203,6 +203,34 @@ CREATE TABLE IF NOT EXISTS audit_events (
  detail TEXT NOT NULL,
  created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS releases (
+ release_id TEXT PRIMARY KEY,
+ logical_name TEXT NOT NULL,
+ version INTEGER NOT NULL,
+ channel TEXT NOT NULL REFERENCES channels(name),
+ shadow_pipeline TEXT NOT NULL UNIQUE REFERENCES pipelines(name),
+ plan_hash TEXT NOT NULL,
+ cutoff_sequence INTEGER NOT NULL,
+ source_prefix_sha256 TEXT NOT NULL,
+ change_head INTEGER NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('preparing','ready','published','cancelled')),
+ created_at TEXT NOT NULL,
+ published_at TEXT,
+ UNIQUE(logical_name,version)
+);
+CREATE INDEX IF NOT EXISTS releases_logical ON releases(logical_name,version);
+CREATE TABLE IF NOT EXISTS release_shadows (
+ release_id TEXT PRIMARY KEY REFERENCES releases(release_id),
+ pipeline TEXT NOT NULL UNIQUE REFERENCES pipelines(name)
+);
+CREATE TABLE IF NOT EXISTS release_bindings (
+ logical_name TEXT PRIMARY KEY,
+ pipeline TEXT NOT NULL REFERENCES pipelines(name),
+ plan_hash TEXT NOT NULL,
+ release_id TEXT REFERENCES releases(release_id),
+ version INTEGER NOT NULL,
+ switched_at TEXT NOT NULL
+);
 """
 
 

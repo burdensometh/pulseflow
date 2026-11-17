@@ -46,6 +46,8 @@ print(app.results.rows('windows'))
 - Rollup 消费同一变更流，将已关闭窗口按 key-to-group 映射汇总；替换/删除输入会撤回旧贡献。当前每次从缓存输入重建汇总结果，且输出与 rollup cursor 在同一目录事务中提交。
 - v1 保存点保存真实分区进度、窗口、键状态、去重、late、结果及变更流，校验源前缀后恢复到同一 catalog 的新管道；允许压缩，不承诺跨不同日志 sequence 布局的目录直接恢复。不能改变 state buckets/hash 版本；现有算子状态表在保存点中显式列举。
 - Replay 创建独立新管道，从同一源日志顺序完整处理，可比较结果和事件去向。它不提供活跃管道的新计划热切换、消费者别名切换或历史结果自动更新。
+- 版本化计划发布（Releases）在 Replay 之上提供可连续切换的发布通道：先以 `releases.bind` 将逻辑名绑定到当前固定管道（version 0）；`releases.prepare(logical, plan, cutoff_sequence)` 创建独立影子管道，按明确源截点（journal sequence）回填并保存该前缀指纹，`releases.catch_up` 让影子管道从自己的已提交位点继续接住准备期间追加的事件，`releases.ready`/`publish` 要求影子追平完整 journal 且截点前缀指纹未变。发布在单事务内把同一逻辑名切到新结果；失败或 `cancel` 保留旧版本，旧管道与旧结果在切换前后始终可读。同一逻辑名的发布按单调 version 加栅栏，过期或已取消的发布任务不能覆盖更新版本。
+- 独立 Consumer 的原有固定管道消费方式（apply/catch_up/bootstrap）保持不变。`promote(source, descriptor)` 按发布描述符在消费端单事务内整体替换物化结果、清空旧变更台账并把 cursor 重置到新管道变更流位点，再从该位点继续消费；切换台账（switch_ledger/binding_history）保证同一发布幂等、旧版本不能回滚覆盖新版本，因此不会混入旧条目、漏掉追加事件或重复累计。描述符校验源实例身份、计划指纹、变更流位点与截点前缀指纹。
 - SQLiteIngress 使用只读源快照采集递增整数序列，将源前缀指纹、连接器水位与事件日志一并提交；已提交源前缀被修改会拒绝继续。Queries.series 对单键已接受事件提供前值保持/线性插值网格和精确时间积分，允许覆盖缺口，单独记录覆盖时长。
 - 文件摄取只接受完整 JSONL 行，保存前缀 hash 与字节/源位点；改写已摄取前缀被拒绝。冻结文件分块导入允许已成功前缀可见。Journal exchange 在受限原子批量内验证并导入完整分区前缀。
 

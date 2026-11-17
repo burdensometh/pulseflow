@@ -11,6 +11,7 @@ from .journal import Journal
 from .operators import Operators
 from .queries import Queries
 from .replay import Replay
+from .releases import Releases
 from .results import Results
 from .rollups import Rollups
 from .savepoints import Savepoints
@@ -51,3 +52,4 @@ class PulseFlow:
         self.replay = Replay(self)
         self.queries = Queries(self)
         self.consistency = Consistency(self)
+        self.releases = Releases(self)

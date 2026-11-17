@@ -267,6 +267,54 @@ class ServicesTest(unittest.TestCase):
         with self.assertRaises(Invalid):
             self.app.rollups.register("bad", "flow", {})
 
+    def test_release_lifecycle_over_http(self):
+        import copy
+
+        from pulseflow.consumer import Consumer
+
+        with serving(self.app) as base:
+
+            def request(path, body=None):
+                raw = None if body is None else json.dumps(body).encode()
+                req = Request(
+                    base + path, data=raw, headers={"Content-Type": "application/json"}
+                )
+                with urlopen(req) as response:
+                    return json.load(response)
+
+            self.populated()
+            cutoff = self.app.catalog.pipeline("flow")["last_sequence"]
+            request("/bindings", {"logical_name": "metrics", "pipeline": "flow"})
+            self.assertEqual(request("/bindings/metrics")["version"], 0)
+            updated = copy.deepcopy(PLAN)
+            updated["mapping"] = {"value": {"literal": "7"}}
+            release = request(
+                "/releases/prepare",
+                {"logical_name": "metrics", "plan": updated, "cutoff_sequence": cutoff},
+            )
+            release_id = release["release_id"]
+            self.assertEqual(request("/releases/" + release_id)["state"], "preparing")
+            request("/releases/" + release_id + "/ready", {})
+            request("/releases/" + release_id + "/publish", {})
+            self.assertEqual(
+                request("/bindings/metrics")["pipeline"], release["shadow_pipeline"]
+            )
+            descriptor = request(
+                "/releases/" + release_id + "/descriptor", {}
+            )
+            self.assertEqual(descriptor["version"], 1)
+            self.assertTrue(request("/releases"))
+            # The consumer can switch using exactly the descriptor served over HTTP.
+            consumer = Consumer(self.home / "http_consumer.sqlite")
+            consumer.catch_up(self.app, "flow")
+            outcome = consumer.promote(self.app, descriptor)
+            self.assertEqual(outcome["release_id"], release_id)
+            self.assertTrue(
+                self.app.queries.compare_consumer(
+                    release["shadow_pipeline"], consumer
+                )["equal"]
+            )
+
     def test_real_http_operational_chain(self):
         with serving(self.app) as base:
 

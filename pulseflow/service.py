@@ -67,7 +67,36 @@ class API:
                 body.get("plan"),
                 body.get("buckets"),
             )
+        if parts == ["releases", "prepare"]:
+            return app.releases.prepare(
+                body["logical_name"],
+                body["plan"],
+                body.get("cutoff_sequence", 0),
+                body.get("buckets"),
+            )
+        if len(parts) == 3 and parts[0] == "releases" and parts[2] in {
+            "catch-up",
+            "ready",
+            "publish",
+            "cancel",
+            "descriptor",
+        }:
+            return self.release_action(parts[1], parts[2], body)
+        if parts == ["bindings"]:
+            return app.releases.bind(body["logical_name"], body["pipeline"])
         raise Missing("operation does not exist")
+
+    def release_action(self, release_id, action, body):
+        releases = self.app.releases
+        if action == "catch-up":
+            return releases.catch_up(release_id, body.get("target_sequence"))
+        if action == "ready":
+            return releases.ready(release_id)
+        if action == "publish":
+            return releases.publish(release_id)
+        if action == "cancel":
+            return releases.cancel(release_id, body.get("reason"))
+        return releases.descriptor(release_id)
 
     def pipeline_action(self, name, action, body):
         app = self.app
@@ -142,6 +171,12 @@ class API:
             }
         if len(parts) == 2 and parts[0] == "exports":
             return app.exports.get(parts[1])
+        if parts == ["releases"]:
+            return app.releases.list()
+        if len(parts) == 2 and parts[0] == "releases":
+            return app.releases.status(parts[1])
+        if len(parts) == 2 and parts[0] == "bindings":
+            return app.releases.current(parts[1])
         raise Missing("operation does not exist")
 
 
