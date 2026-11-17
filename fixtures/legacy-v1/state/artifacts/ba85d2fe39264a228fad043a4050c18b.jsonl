@@ -1,0 +1,8 @@
+{"document":{"end":10,"key":"key0","kind":"window","metrics":{"count":1,"distinct":1,"max":"1","mean":"1","min":"1","p50":"1","p95":"1","sum":"1"},"start":0},"result_key":"[\"window\",\"key0\",0,10]","revision":1}
+{"document":{"end":10,"key":"key1","kind":"window","metrics":{"count":1,"distinct":1,"max":"2","mean":"2","min":"2","p50":"2","p95":"2","sum":"2"},"start":0},"result_key":"[\"window\",\"key1\",0,10]","revision":1}
+{"document":{"end":10,"key":"key2","kind":"window","metrics":{"count":1,"distinct":1,"max":"3","mean":"3","min":"3","p50":"3","p95":"3","sum":"3"},"start":0},"result_key":"[\"window\",\"key2\",0,10]","revision":1}
+{"document":{"end":10,"key":"key3","kind":"window","metrics":{"count":1,"distinct":1,"max":"4","mean":"4","min":"4","p50":"4","p95":"4","sum":"4"},"start":0},"result_key":"[\"window\",\"key3\",0,10]","revision":1}
+{"document":{"end":10,"key":"key4","kind":"window","metrics":{"count":1,"distinct":1,"max":"5","mean":"5","min":"5","p50":"5","p95":"5","sum":"5"},"start":0},"result_key":"[\"window\",\"key4\",0,10]","revision":1}
+{"document":{"end":10,"key":"key5","kind":"window","metrics":{"count":1,"distinct":1,"max":"6","mean":"6","min":"6","p50":"6","p95":"6","sum":"6"},"start":0},"result_key":"[\"window\",\"key5\",0,10]","revision":1}
+{"document":{"end":10,"key":"key6","kind":"window","metrics":{"count":1,"distinct":1,"max":"7","mean":"7","min":"7","p50":"7","p95":"7","sum":"7"},"start":0},"result_key":"[\"window\",\"key6\",0,10]","revision":1}
+{"document":{"end":10,"key":"key7","kind":"window","metrics":{"count":1,"distinct":1,"max":"8","mean":"8","min":"8","p50":"8","p95":"8","sum":"8"},"start":0},"result_key":"[\"window\",\"key7\",0,10]","revision":1}
