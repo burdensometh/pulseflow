@@ -15,6 +15,13 @@ from .values import (
 )
 
 
+V1_FORMAT = 1
+V2_FORMAT = 2
+SUPPORTED_FORMATS = {V1_FORMAT, V2_FORMAT}
+
+# Physical state tables and their stored columns.  v1 savepoints pin every
+# keyed row to its original state bucket, which makes the format impossible to
+# restore under a different bucket count.
 STATE_TABLES = {
     "progress": ["partition_id", "next_offset", "max_time", "declared_time"],
     "window_events": [
@@ -54,6 +61,49 @@ STATE_TABLES = {
     "changes": ["result_key", "revision", "operation", "document"],
 }
 
+# v2 stores bucketed rows without a fixed bucket: ownership is derived from the
+# group key against whatever bucket count the destination pipeline uses, so a
+# savepoint can be restored into a differently sharded pipeline.
+V2_STATE_TABLES = {
+    table: [column for column in columns if column != "bucket"]
+    for table, columns in STATE_TABLES.items()
+}
+
+BUCKETED_TABLES = ("window_events", "window_status", "keyed_state")
+BUCKET_GROUP_COLUMN = {
+    "window_events": "group_key",
+    "window_status": "group_key",
+    "keyed_state": "group_key",
+}
+
+# Logical primary-key columns of each state table, independent of the physical
+# bucket prefix.  Duplicates here would violate a table constraint while the
+# destination pipeline is being built, so they are rejected up front.
+LOGICAL_KEYS = {
+    "progress": ["partition_id"],
+    "window_events": ["window_start", "group_key", "event_id"],
+    "window_status": ["window_start", "group_key"],
+    "keyed_state": ["state_kind", "group_key"],
+    "seen_keys": ["dedup_key"],
+    "late_events": ["event_id"],
+    "processed_events": ["event_id"],
+    "results": ["result_key"],
+    "changes": ["result_key", "revision"],
+}
+
+
+def logical_columns(version, table):
+    return (
+        V2_STATE_TABLES[table]
+        if version == V2_FORMAT
+        else STATE_TABLES[table]
+    )
+
+
+def layout_columns(version, table):
+    """Columns of a state row as it actually appears inside a savepoint."""
+    return logical_columns(version, table)
+
 
 class Savepoints:
     def __init__(self, catalog, journal, artifacts):
@@ -67,14 +117,18 @@ class Savepoints:
             info = self.catalog.pipeline(pipeline, connection)
             source = self.catalog.channel(info["channel"], connection)
             tables = {}
-            for table, columns in STATE_TABLES.items():
+            for table, physical_columns in STATE_TABLES.items():
+                columns = logical_columns(V2_FORMAT, table)
                 order = "sequence" if table == "changes" else ",".join(columns)
-                sql = f'SELECT {",".join(columns)} FROM {table} WHERE pipeline=? ORDER BY {order}'
+                sql = (
+                    f"SELECT {','.join(columns)} FROM {table} "
+                    "WHERE pipeline=? ORDER BY " + order
+                )
                 tables[table] = [
                     list(row) for row in connection.execute(sql, (pipeline,))
                 ]
             document = {
-                "format_version": 1,
+                "format_version": V2_FORMAT,
                 "point_id": point_id,
                 "pipeline": info,
                 "channel_partitions": source["partitions"],
@@ -102,6 +156,7 @@ class Savepoints:
             **artifact,
             "point_id": point_id,
             "generation": info["generation"],
+            "format_version": V2_FORMAT,
             "compressed": compressed,
         }
 
@@ -132,42 +187,54 @@ class Savepoints:
         if (
             not isinstance(document, dict)
             or set(document) != required
-            or document["format_version"] != 1
+            or document.get("format_version") not in SUPPORTED_FORMATS
         ):
             raise Invalid("unsupported savepoint format")
+        version = document["format_version"]
         info = document["pipeline"]
         if not isinstance(info, dict):
             raise Invalid("savepoint pipeline is invalid")
         plan = plan_spec(info["plan"])
         if fingerprint(plan) != info["plan_hash"]:
             raise Conflict("savepoint plan fingerprint mismatch")
-        buckets = integer(info["buckets"], "savepoint state buckets", 1, 128)
+        source_buckets = integer(info["buckets"], "savepoint state buckets", 1, 128)
         if info["hash_version"] != 1:
             raise Invalid("unsupported savepoint state hash")
         integer(info["last_sequence"], "savepoint cursor", 0)
         integer(info["generation"], "savepoint generation", 0)
         state = document["state"]
-        if not isinstance(state, dict) or set(state) != set(STATE_TABLES):
+        expected_tables = set(STATE_TABLES)
+        if not isinstance(state, dict) or set(state) != expected_tables:
             raise Invalid("savepoint state sections mismatch")
         total = 0
-        for table, columns in STATE_TABLES.items():
+        for table in expected_tables:
+            columns = layout_columns(version, table)
             rows = state[table]
             if not isinstance(rows, list):
                 raise Invalid("savepoint state must contain arrays")
             total += len(rows)
+            group_column = BUCKET_GROUP_COLUMN.get(table)
+            key_indexes = [columns.index(name) for name in LOGICAL_KEYS[table]]
+            seen_keys = set()
             for row in rows:
                 if not isinstance(row, list) or len(row) != len(columns):
                     raise Invalid("savepoint state row layout mismatch")
                 named = dict(zip(columns, row))
-                if "bucket" in named:
+                logical_key = tuple(row[index] for index in key_indexes)
+                if logical_key in seen_keys:
+                    raise Invalid("savepoint state contains a duplicate logical key")
+                seen_keys.add(logical_key)
+                if version == V1_FORMAT and table in BUCKETED_TABLES:
                     expected = bucket_for(
-                        named["group_key"], buckets, info["hash_version"]
+                        named[group_column], source_buckets, info["hash_version"]
                     )
                     if named["bucket"] != expected:
                         raise Conflict("savepoint key is in the wrong state bucket")
                 for field in ["document", "transformed"]:
-                    if named.get(field) is not None:
+                    if field in named and named[field] is not None:
                         json.loads(named[field])
+        if version == V2_FORMAT:
+            self._validate_v2_references(state)
         if total > 1000000:
             raise Invalid("savepoint row count exceeds limit")
         partitions = integer(
@@ -178,11 +245,30 @@ class Savepoints:
             raise Invalid("savepoint partition progress is incomplete")
         return document
 
+    def _validate_v2_references(self, state):
+        # v2 dropped the physical bucket column; make sure the logical window
+        # state stays internally consistent without it.
+        # v2 logical columns:
+        #   window_events: [window_start, group_key, event_id, event_time,
+        #                   value, document]
+        #   window_status: [window_start, window_end, group_key, status,
+        #                   result_revision]
+        events = {(row[0], row[1]) for row in state["window_events"]}
+        statuses = {(row[0], row[2]) for row in state["window_status"]}
+        if statuses != events:
+            raise Invalid("savepoint window state references are inconsistent")
+        if any(row[3] not in ("open", "closed") for row in state["window_status"]):
+            raise Invalid("savepoint window status is invalid")
+
     def restore(self, document, destination, buckets=None):
         self.validate(document)
+        version = document["format_version"]
         destination = identifier(destination)
         info = document["pipeline"]
-        if buckets is not None and buckets != info["buckets"]:
+        target_buckets = info["buckets"] if buckets is None else integer(
+            buckets, "state buckets", 1, 128
+        )
+        if version == V1_FORMAT and target_buckets != info["buckets"]:
             raise Conflict("v1 savepoint cannot rescale keyed state")
         with self.catalog.transaction(True) as connection:
             channel = self.catalog.channel(info["channel"], connection)
@@ -206,7 +292,7 @@ class Savepoints:
                     info["channel"],
                     canonical(info["plan"]),
                     info["plan_hash"],
-                    info["buckets"],
+                    target_buckets,
                     info["hash_version"],
                     info["watermark"],
                     info["last_sequence"],
@@ -214,18 +300,46 @@ class Savepoints:
                     utc_now(),
                 ),
             )
-            for table, columns in STATE_TABLES.items():
-                names = ["pipeline"] + columns
+            for table, physical_columns in STATE_TABLES.items():
+                stored_columns = layout_columns(version, table)
+                group_column = BUCKET_GROUP_COLUMN.get(table)
+                rows = []
+                for row in document["state"][table]:
+                    named = dict(zip(stored_columns, row))
+                    if table in BUCKETED_TABLES:
+                        bucket = bucket_for(
+                            named[group_column],
+                            target_buckets,
+                            info["hash_version"],
+                        )
+                        if version == V1_FORMAT:
+                            # Keep the full v1 row shape; only the bucket slot
+                            # is rewritten to the destination layout.
+                            rewritten = list(row)
+                            rewritten[0] = bucket
+                            rows.append(rewritten)
+                        else:
+                            rows.append([bucket, *row])
+                    else:
+                        rows.append(list(row))
+                names = ["pipeline"] + physical_columns
                 placeholders = ",".join("?" for _ in names)
                 sql = f'INSERT INTO {table}({",".join(names)}) VALUES ({placeholders})'
                 connection.executemany(
-                    sql, ([destination] + row for row in document["state"][table])
+                    sql, ([destination] + row for row in rows)
                 )
             self.catalog.event(
                 connection,
                 destination,
                 "savepoint_restored",
-                {"point_id": document["point_id"], "source": info["name"]},
+                {
+                    "point_id": document["point_id"],
+                    "source": info["name"],
+                    "format_version": version,
+                    "source_buckets": info["buckets"],
+                    "buckets": target_buckets,
+                    "rescaled": target_buckets != info["buckets"],
+                },
             )
         return self.catalog.pipeline(destination)
 

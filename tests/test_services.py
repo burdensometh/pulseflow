@@ -39,12 +39,15 @@ class ServicesTest(unittest.TestCase):
         saved = self.app.savepoints.create("flow", compressed=True)
         self.assertEqual(self.app.savepoints.get(saved["point_id"])["generation"], 1)
         point = self.app.savepoints.load(saved["point_id"])
-        self.assertEqual(point["format_version"], 1)
+        self.assertEqual(point["format_version"], 2)
         self.app.savepoints.restore_point(saved["point_id"], "restored")
         self.assertTrue(self.app.replay.compare("flow", "restored")["equal"])
         self.assertTrue(self.app.consistency.check("restored")["ok"])
-        with self.assertRaises(Conflict):
-            self.app.savepoints.restore(point, "scaled", buckets=7)
+        scaled = self.app.savepoints.restore(point, "scaled", buckets=7)
+        self.assertEqual(scaled["buckets"], 7)
+        self.assertEqual(self.app.catalog.pipeline("scaled")["hash_version"], 1)
+        self.assertTrue(self.app.consistency.check("scaled")["ok"])
+        self.assertTrue(self.app.replay.compare("flow", "scaled")["equal"])
         with self.assertRaises(Conflict):
             self.app.savepoints.restore(point, "restored")
         self.app.journal.append(
@@ -52,8 +55,11 @@ class ServicesTest(unittest.TestCase):
         )
         self.app.engine.drain("flow")
         self.app.engine.drain("restored")
+        self.app.engine.drain("scaled")
         self.assertTrue(self.app.replay.compare("flow", "restored")["equal"])
-        self.assertTrue(self.app.consistency.check("restored")["ok"])
+        self.assertTrue(self.app.replay.compare("flow", "scaled")["equal"])
+        self.assertTrue(self.app.consistency.check("scaled")["ok"])
+        self.assertEqual(self.app.replay.disposition_diff("flow", "scaled"), [])
         self.assertEqual(len(self.app.savepoints.list("flow")), 1)
         uncompressed = self.app.savepoints.create("flow")
         self.assertFalse(uncompressed["compressed"])
@@ -65,26 +71,32 @@ class ServicesTest(unittest.TestCase):
     def test_savepoint_validation_rejects_corrupt_source_and_layout(self):
         self.populated()
         point = self.app.savepoints.load(self.app.savepoints.create("flow")["point_id"])
+        self.assertEqual(point["format_version"], 2)
         altered = copy.deepcopy(point)
         altered["source_prefix_sha256"] = "0" * 64
         with self.assertRaises(Conflict):
             self.app.savepoints.restore(altered, "badprefix")
         for mutate in [
-            lambda p: p.update(format_version=2),
+            lambda p: p.update(format_version=3),
             lambda p: p["pipeline"].update(hash_version=2),
             lambda p: p["state"]["progress"].clear(),
             lambda p: p["state"]["results"][0].append("extra"),
+            lambda p: p["state"]["window_events"][0].__setitem__(0, -999999),
+            lambda p: p["state"]["keyed_state"].append(
+                list(p["state"]["keyed_state"][0])
+            ),
         ]:
             altered = copy.deepcopy(point)
             mutate(altered)
             with self.assertRaises(Invalid):
                 self.app.savepoints.validate(altered)
+        # A v1 flag over v2-shaped rows cannot pretend to be a legacy point.
         altered = copy.deepcopy(point)
-        altered["pipeline"]["plan_hash"] = "0" * 64
-        with self.assertRaises(Conflict):
+        altered["format_version"] = 1
+        with self.assertRaises(Invalid):
             self.app.savepoints.validate(altered)
         altered = copy.deepcopy(point)
-        altered["state"]["window_events"][0][0] = 100
+        altered["pipeline"]["plan_hash"] = "0" * 64
         with self.assertRaises(Conflict):
             self.app.savepoints.validate(altered)
         with self.assertRaises(Missing):
