@@ -1,0 +1,4 @@
+{"document":{"end":8,"key":"a","kind":"window","metrics":{"count":3,"sum":"3"},"start":-3},"result_key":"[\"window\",\"a\",-3,8]","revision":1}
+{"document":{"end":5,"key":"a","kind":"window","metrics":{"count":4,"sum":"4"},"start":-6},"result_key":"[\"window\",\"a\",-6,5]","revision":1}
+{"document":{"end":2,"key":"a","kind":"window","metrics":{"count":2,"sum":"2"},"start":-9},"result_key":"[\"window\",\"a\",-9,2]","revision":1}
+{"document":{"end":11,"key":"a","kind":"window","metrics":{"count":2,"sum":"2"},"start":0},"result_key":"[\"window\",\"a\",0,11]","revision":1}
