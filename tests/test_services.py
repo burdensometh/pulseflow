@@ -355,6 +355,13 @@ class ServicesTest(unittest.TestCase):
                 {**package, "destination": "httpcopy", "batch_id": "copy"},
             )
             request("/replay", {"source": "httpflow", "destination": "httpfork"})
+            repair = request("/pipelines/httpflow/repair-windows", {})
+            self.assertEqual(repair["pipelines"][0]["pipeline"], "httpflow")
+            self.assertTrue(request("/pipelines/httpflow/check")["ok"])
+            # A second repair over the API is an idempotent no-op.
+            again = request("/pipelines/httpflow/repair-windows", {})
+            report = again["pipelines"][0]
+            self.assertTrue(all(report[key] == 0 for key in report if key != "pipeline"))
             request(
                 "/pipelines/httpflow/replace-results",
                 {"expected_head": self.app.results.head("httpflow"), "documents": {}},

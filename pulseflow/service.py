@@ -83,6 +83,8 @@ class API:
             return app.results.replace_visible(
                 name, body["expected_head"], body["documents"]
             )
+        if action == "repair-windows":
+            return app.repair.reconcile(name)
         raise Missing("pipeline operation does not exist")
 
     def get(self, parts, query):

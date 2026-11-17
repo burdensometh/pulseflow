@@ -7,8 +7,12 @@ from .values import Invalid, canonical
 
 def starts_for(event_time, spec):
     slide, size, offset = spec["slide_ms"], spec["size_ms"], spec["offset_ms"]
-    last = int((event_time - offset) / slide) * slide + offset
-    count = size // slide
+    # Floor division keeps the grid aligned across negative event times;
+    # ceiling division keeps every overlapping window when size is not a
+    # multiple of slide. Membership is then checked against the
+    # half-open interval [start, start + size).
+    last = (event_time - offset) // slide * slide + offset
+    count = (size + slide - 1) // slide
     return [
         start
         for start in (last - i * slide for i in range(count))

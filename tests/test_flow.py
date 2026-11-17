@@ -140,6 +140,8 @@ class FlowTest(unittest.TestCase):
             sorted(starts_for(-1, self.app.catalog.pipeline("hops")["plan"]["window"])),
             [-9, -6, -3],
         )
+        # size 10 / slide 3 means a row belongs to at most ceil(10/3) = 4
+        # windows; t=2 only reaches the three windows still covering it
         self.assertEqual(len(self.app.queries.event("hops", "uneven")["windows"]), 3)
         self.assertEqual(len(self.app.queries.event("hops", "boundary")["windows"]), 4)
         self.assertTrue(self.app.consistency.check("hops")["ok"])
@@ -150,6 +152,67 @@ class FlowTest(unittest.TestCase):
         )
         for row in self.app.windows.inspect("hops"):
             self.assertEqual(row["status"], "closed")
+
+    def test_hopping_nondivisible_size_and_negative_grid_membership(self):
+        # 11 is not a multiple of 3: every row belongs to ceil(11/3) = 4 windows
+        plan = {"window": {"kind": "hopping", "size_ms": 11, "slide_ms": 3}}
+        self.app.engine.create("grid", "readings", plan)
+        rows = [
+            reading("event0", -5),
+            reading("event1", -3),
+            reading("event2", 0),
+            reading("event3", 2),
+            reading("event4", 15),
+        ]
+        self.app.journal.append(
+            "readings", "batch", [record(i, row) for i, row in enumerate(rows)]
+        )
+        self.app.engine.drain("grid")
+        expected = {
+            "event0": [-15, -12, -9, -6],
+            "event1": [-12, -9, -6, -3],
+            "event2": [-9, -6, -3, 0],
+            "event3": [-6, -3, 0],
+            "event4": [6, 9, 12, 15],
+        }
+        for event_id, starts in expected.items():
+            actual = sorted(
+                row["window_start"]
+                for row in self.app.queries.event("grid", event_id)["windows"]
+            )
+            self.assertEqual(actual, starts)
+        # right boundary stays exclusive: event at t=2 is not in [-9,2);
+        # t=0 is inside that window, t=2 instead belongs to [-6,5)
+        minus_nine = self.app.windows.preview("grid", -9, "a")["rows"]
+        self.assertEqual([row["id"] for row in minus_nine], ["event0", "event1", "event2"])
+        minus_six = self.app.windows.preview("grid", -6, "a")["rows"]
+        self.assertEqual(
+            [row["id"] for row in minus_six],
+            ["event0", "event1", "event2", "event3"],
+        )
+        self.assertTrue(self.app.consistency.check("grid")["ok"])
+
+    def test_starts_for_grid_offset_and_negative_offsets(self):
+        shifted = {"kind": "hopping", "size_ms": 10, "slide_ms": 10, "offset_ms": 7}
+        self.assertEqual(starts_for(0, shifted), [-3])
+        self.assertEqual(starts_for(-3, shifted), [-3])
+        self.assertEqual(starts_for(7, shifted), [7])
+        self.assertEqual(starts_for(6, shifted), [-3])
+        negative_offset = {
+            "kind": "hopping",
+            "size_ms": 11,
+            "slide_ms": 3,
+            "offset_ms": -4,
+        }
+        for t in range(-30, 31):
+            for start in starts_for(t, negative_offset):
+                self.assertIn((start + 4) % 3, (0,))
+                self.assertLessEqual(start, t)
+                self.assertLess(t, start + 11)
+        tumbling = {"kind": "tumbling", "size_ms": 10, "slide_ms": 10, "offset_ms": 0}
+        self.assertEqual(starts_for(-1, tumbling), [-10])
+        self.assertEqual(starts_for(-10, tumbling), [-10])
+        self.assertEqual(starts_for(-11, tumbling), [-20])
 
     def test_watermarks_wait_for_all_partitions_and_keep_late_evidence(self):
         self.app.journal.create("two", 2)

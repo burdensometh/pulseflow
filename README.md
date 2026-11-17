@@ -35,7 +35,8 @@ print(app.results.rows('windows'))
 
 - 源分区从位点 0 连续追加，位点内容和通道内事件 ID 不可重用为其他数据。批次重放幂等；同批异内容拒绝。源记录与源位点在同一事务中提交。
 - 时间支持带时区 ISO 文本或整数毫秒，包括 epoch 前负时间；拒绝隐式时区和子毫秒值。测量值使用精确十进制，拒绝 float、NaN、无穷与超出精度的值。
-- 窗口是左闭右开区间；支持 tumbling 与任意合法 slide 的 hopping，可带网格偏移。统计含行数/非空数、精确和/均值、极值、nearest-rank p50/p95 和精确 distinct。均值四舍五入到 12 位小数。
+- 窗口是左闭右开区间；支持 tumbling 与任意合法 slide 的 hopping，可带网格偏移。网格起点用 floor 除法对齐，负事件时间（含偏移后为负）归属正确；每行最多属于 ceil(size/slide) 个窗口，size 不能整除 slide 时不会漏掉重叠窗口。统计含行数/非空数、精确和/均值、极值、nearest-rank p50/p95 和精确 distinct。均值四舍五入到 12 位小数。
+- `repair.reconcile()` 对已运行管道做增量窗口归属补正：不改动源日志、源位点、处理游标与水位，只按当前归属公式对齐 `window_events`/`window_status`，变化的窗口结果经既有变更流发布更高 revision，下游 Consumer/Rollup 正常 catch-up 即收敛到正确窗口；补正按差异执行，重复运行是零写入 no-op，并在审计流记录 `window_membership_repaired`。操作 API 对应 `POST /pipelines/{name}/repair-windows`。
 - 分区最大事件时间或显式声明的时间减 delay，再对所有源分区取最小值；未见任何事件且未声明的分区阻止水位前进。全局水位单向推进；事件时间严格小于当前水位的记录保存为 late，不再更新窗口。等于水位仍可接收。
 - 当窗口右边界不大于水位时发布结果。当前实现保留完整窗口事件，关闭时读入内存计算，受 max_window_events 限制；没有磁盘溢写统计或窗口状态自动回收。
 - 处理顺序使用持久源日志的 sequence，每个 chunk 的源进度、算子状态、水位、结果和变更流一起提交。任一转换错误使整个 chunk 回滚；当前不支持按故障分区隔离，也没有自动修复事件。
