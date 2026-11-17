@@ -14,13 +14,19 @@ from .values import (
 
 
 class Engine:
-    def __init__(self, catalog, journal, watermarks, windows, operators, leases):
+    def __init__(self, catalog, journal, watermarks, windows, sessions, operators, leases):
         self.catalog = catalog
         self.journal = journal
         self.watermarks = watermarks
         self.windows = windows
+        self.sessions = sessions
         self.operators = operators
         self.leases = leases
+
+    def windowed(self, pipeline):
+        if pipeline["plan"]["window"]["kind"] == "session":
+            return self.sessions
+        return self.windows
 
     def create(self, name, channel, plan, buckets=4):
         name = identifier(name)
@@ -79,10 +85,10 @@ class Engine:
                     (info["last_sequence"], pipeline),
                 )
                 self.watermarks.advance_in(connection, info)
-                self.windows.close(connection, info)
+                self.windowed(info).close(connection, info)
                 self.operators.expire(connection, info)
             self.watermarks.advance_in(connection, info)
-            closed = self.windows.close(connection, info)
+            closed = self.windowed(info).close(connection, info)
             self.operators.expire(connection, info)
             generation = info["generation"] + 1
             connection.execute(
@@ -143,7 +149,7 @@ class Engine:
                 disposition = "duplicate"
             else:
                 disposition = "accepted"
-                self.windows.add(connection, pipeline, transformed)
+                self.windowed(pipeline).add(connection, pipeline, transformed)
                 self.operators.latest(connection, pipeline, transformed)
                 self.operators.sequence(connection, pipeline, transformed)
         connection.execute(

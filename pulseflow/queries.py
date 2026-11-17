@@ -30,6 +30,14 @@ class Queries:
                     (pipeline, event_id),
                 )
             ]
+            sessions = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT bucket,session_start,group_key FROM session_events "
+                    "WHERE pipeline=? AND event_id=? ORDER BY session_start",
+                    (pipeline, event_id),
+                )
+            ]
             late = connection.execute(
                 "SELECT watermark FROM late_events WHERE pipeline=? AND event_id=?",
                 (pipeline, event_id),
@@ -38,6 +46,7 @@ class Queries:
                 "source": {**dict(source), "document": json.loads(source["document"])},
                 "processed": dict(processed) if processed else None,
                 "windows": memberships,
+                "sessions": sessions,
                 "rejection_watermark": late[0] if late else None,
             }
 
@@ -91,6 +100,15 @@ class Queries:
         preview = self.app.windows.preview(pipeline, start, key)
         return {
             "window_start": start,
+            "key": key,
+            "events": [self.event(pipeline, row["id"]) for row in preview["rows"]],
+            "metrics": preview["metrics"],
+        }
+
+    def session_lineage(self, pipeline, start, key):
+        preview = self.app.sessions.preview(pipeline, start, key)
+        return {
+            "session_start": start,
             "key": key,
             "events": [self.event(pipeline, row["id"]) for row in preview["rows"]],
             "metrics": preview["metrics"],

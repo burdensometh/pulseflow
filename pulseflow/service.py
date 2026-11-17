@@ -119,6 +119,10 @@ class API:
                 return app.windows.inspect(
                     name, query_integer(query, "start"), query.get("key", [None])[0]
                 )
+            if action == "sessions":
+                return app.sessions.inspect(
+                    name, query_integer(query, "start"), query.get("key", [None])[0]
+                )
             if action == "check":
                 return app.consistency.check(name)
             if action == "lag":

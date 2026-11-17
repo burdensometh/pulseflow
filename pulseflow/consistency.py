@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 
 from .state import bucket_for
 from .values import canonical, fingerprint
@@ -81,6 +82,9 @@ class Consistency:
                 problems.append("processed partition offsets do not match progress")
 
     def check_membership(self, connection, info, problems):
+        if info["plan"]["window"]["kind"] == "session":
+            self.check_sessions(connection, info, problems)
+            return
         actual = {}
         for row in connection.execute(
             "SELECT * FROM window_events WHERE pipeline=?", (info["name"],)
@@ -106,6 +110,91 @@ class Consistency:
                 info["watermark"] is None or row["window_end"] > info["watermark"]
             ):
                 problems.append("window closed ahead of watermark")
+
+    def check_sessions(self, connection, info, problems):
+        gap = info["plan"]["window"]["gap_ms"]
+        accepted = {}
+        for row in connection.execute(
+            "SELECT event_id,transformed FROM processed_events "
+            "WHERE pipeline=? AND disposition='accepted'",
+            (info["name"],),
+        ):
+            accepted[row["event_id"]] = json.loads(row["transformed"])
+        status = {}
+        for row in connection.execute(
+            "SELECT * FROM session_status WHERE pipeline=?", (info["name"],)
+        ):
+            if row["bucket"] != bucket_for(
+                row["group_key"], info["buckets"], info["hash_version"]
+            ):
+                problems.append("session status is in the wrong state bucket")
+            identity = (row["group_key"], row["session_start"])
+            if identity in status:
+                problems.append("duplicate session status row")
+            status[identity] = dict(row)
+            if row["status"] == "closed" and (
+                info["watermark"] is None or row["session_end"] > info["watermark"]
+            ):
+                problems.append("session closed ahead of watermark")
+        stored = {}
+        for row in connection.execute(
+            "SELECT * FROM session_events WHERE pipeline=?", (info["name"],)
+        ):
+            if row["bucket"] != bucket_for(
+                row["group_key"], info["buckets"], info["hash_version"]
+            ):
+                problems.append("session event is in the wrong state bucket")
+            document = json.loads(row["document"])
+            if document["id"] != row["event_id"] or document["key"] != row["group_key"]:
+                problems.append("session event document mismatch")
+            identity = (row["group_key"], row["session_start"])
+            if identity not in status:
+                problems.append("session events without a session status")
+            stored.setdefault(identity, []).append(row["event_id"])
+            if row["event_id"] not in accepted:
+                problems.append("session holds an event that was not accepted")
+        for identity in set(status) - set(stored):
+            problems.append("session status without any events")
+        membership = Counter()
+        for identity, event_ids in stored.items():
+            if identity not in status:
+                continue
+            end = status[identity]["session_end"]
+            for event_id in event_ids:
+                membership[event_id] += 1
+                if event_id in accepted:
+                    event_time = accepted[event_id]["time"]
+                    if not identity[1] <= event_time < end:
+                        problems.append("session does not contain its event time")
+        for event_id in accepted:
+            if membership[event_id] != 1:
+                problems.append("accepted event is not in exactly one session")
+        expected = {}
+        by_key = {}
+        for event_id, document in accepted.items():
+            by_key.setdefault(document["key"], []).append(
+                (document["time"], event_id)
+            )
+        for key, items in by_key.items():
+            items.sort()
+            start, last, ids = None, None, []
+            for event_time, event_id in items:
+                if ids and event_time - last >= gap:
+                    expected[(key, start)] = (last + gap, sorted(ids))
+                    ids = []
+                if not ids:
+                    start = event_time
+                ids.append(event_id)
+                last = event_time
+            if ids:
+                expected[(key, start)] = (last + gap, sorted(ids))
+        actual = {
+            identity: (status[identity]["session_end"], sorted(event_ids))
+            for identity, event_ids in stored.items()
+            if identity in status
+        }
+        if actual != expected:
+            problems.append("stored sessions differ from event-time recomputation")
 
     def check_results(self, connection, info, problems):
         for row in connection.execute(
@@ -140,3 +229,21 @@ class Consistency:
             ).fetchone()
             if row is None or row["revision"] < window["result_revision"]:
                 problems.append("closed window result revision is missing")
+        for session in connection.execute(
+            "SELECT * FROM session_status WHERE pipeline=? AND status='closed'",
+            (info["name"],),
+        ):
+            key = canonical(
+                [
+                    "session",
+                    session["group_key"],
+                    session["session_start"],
+                    session["session_end"],
+                ]
+            )
+            row = connection.execute(
+                "SELECT revision FROM results WHERE pipeline=? AND result_key=?",
+                (info["name"], key),
+            ).fetchone()
+            if row is None or row["revision"] < session["result_revision"]:
+                problems.append("closed session result revision is missing")

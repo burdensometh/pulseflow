@@ -16,10 +16,16 @@ METRICS = {
 
 
 def window_spec(value):
+    if isinstance(value, dict) and value.get("kind") == "session":
+        require_keys(value, ["kind", "gap_ms"])
+        return {
+            "kind": "session",
+            "gap_ms": integer(value["gap_ms"], "session gap", 1, 86400000),
+        }
     require_keys(value, ["kind", "size_ms"], ["slide_ms", "offset_ms"])
     kind = value["kind"]
     if kind not in {"tumbling", "hopping"}:
-        raise Invalid("only tumbling and hopping windows are available")
+        raise Invalid("only tumbling, hopping and session windows are available")
     size = integer(value["size_ms"], "window size", 1, 86400000)
     slide = integer(value.get("slide_ms", size), "window slide", 1, size)
     if kind == "tumbling" and slide != size:

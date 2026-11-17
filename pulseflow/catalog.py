@@ -89,6 +89,27 @@ CREATE TABLE IF NOT EXISTS window_status (
  result_revision INTEGER,
  PRIMARY KEY(pipeline,bucket,window_start,group_key)
 );
+CREATE TABLE IF NOT EXISTS session_events (
+ pipeline TEXT NOT NULL REFERENCES pipelines(name),
+ bucket INTEGER NOT NULL,
+ session_start INTEGER NOT NULL,
+ group_key TEXT NOT NULL,
+ event_id TEXT NOT NULL,
+ event_time INTEGER NOT NULL,
+ value TEXT,
+ document TEXT NOT NULL,
+ PRIMARY KEY(pipeline,bucket,session_start,group_key,event_id)
+);
+CREATE TABLE IF NOT EXISTS session_status (
+ pipeline TEXT NOT NULL REFERENCES pipelines(name),
+ bucket INTEGER NOT NULL,
+ session_start INTEGER NOT NULL,
+ session_end INTEGER NOT NULL,
+ group_key TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('open','closed')),
+ result_revision INTEGER,
+ PRIMARY KEY(pipeline,bucket,session_start,group_key)
+);
 CREATE TABLE IF NOT EXISTS keyed_state (
  pipeline TEXT NOT NULL REFERENCES pipelines(name),
  bucket INTEGER NOT NULL,

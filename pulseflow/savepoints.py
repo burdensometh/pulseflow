@@ -34,6 +34,23 @@ STATE_TABLES = {
         "status",
         "result_revision",
     ],
+    "session_events": [
+        "bucket",
+        "session_start",
+        "group_key",
+        "event_id",
+        "event_time",
+        "value",
+        "document",
+    ],
+    "session_status": [
+        "bucket",
+        "session_start",
+        "session_end",
+        "group_key",
+        "status",
+        "result_revision",
+    ],
     "keyed_state": ["bucket", "state_kind", "group_key", "document"],
     "seen_keys": ["dedup_key", "expires_at", "event_id"],
     "late_events": [

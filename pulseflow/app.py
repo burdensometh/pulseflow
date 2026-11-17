@@ -14,6 +14,7 @@ from .replay import Replay
 from .results import Results
 from .rollups import Rollups
 from .savepoints import Savepoints
+from .sessions import Sessions
 from .state import KeyedState, Leases
 from .sqlite_source import SQLiteIngress
 from .streams import FileIngress
@@ -32,12 +33,14 @@ class PulseFlow:
         self.leases = Leases(self.catalog)
         self.watermarks = Watermarks(self.catalog)
         self.windows = Windows(self.catalog, self.results)
+        self.sessions = Sessions(self.catalog, self.results)
         self.operators = Operators(self.state, self.dimensions, self.results)
         self.engine = Engine(
             self.catalog,
             self.journal,
             self.watermarks,
             self.windows,
+            self.sessions,
             self.operators,
             self.leases,
         )
