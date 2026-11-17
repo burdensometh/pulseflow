@@ -3,8 +3,10 @@ import time
 import uuid
 
 from .spec import plan_spec
+from .operators import EVENT_DISPOSITIONS
 from .values import (
     Conflict,
+    Invalid,
     canonical,
     fingerprint,
     identifier,
@@ -14,18 +16,26 @@ from .values import (
 
 
 class Engine:
-    def __init__(self, catalog, journal, watermarks, windows, operators, leases):
+    def __init__(
+        self,
+        catalog,
+        journal,
+        watermarks,
+        transform,
+        operators,
+        leases,
+    ):
         self.catalog = catalog
         self.journal = journal
         self.watermarks = watermarks
-        self.windows = windows
+        self.transform = transform
         self.operators = operators
         self.leases = leases
 
     def create(self, name, channel, plan, buckets=4):
         name = identifier(name)
         buckets = integer(buckets, "state buckets", 1, 128)
-        plan = plan_spec(plan)
+        plan = plan_spec(plan, self.operators.plan_extensions())
         checksum = fingerprint(plan)
         with self.catalog.transaction(True) as connection:
             source = self.catalog.channel(channel, connection)
@@ -58,6 +68,14 @@ class Engine:
             )
         return self.catalog.pipeline(name)
 
+    def _flush_watermark(self, connection, info):
+        closed = 0
+        for operator in self.operators.watermark_chain(info["plan"]):
+            flushed = operator.watermark(connection, info)
+            if type(flushed) is int:
+                closed += flushed
+        return closed
+
     def step(self, pipeline, lease, now_ms, limit=1000):
         integer(limit, "processing chunk", 1, 10000)
         if lease["pipeline"] != pipeline:
@@ -79,11 +97,9 @@ class Engine:
                     (info["last_sequence"], pipeline),
                 )
                 self.watermarks.advance_in(connection, info)
-                self.windows.close(connection, info)
-                self.operators.expire(connection, info)
+                self._flush_watermark(connection, info)
             self.watermarks.advance_in(connection, info)
-            closed = self.windows.close(connection, info)
-            self.operators.expire(connection, info)
+            closed = self._flush_watermark(connection, info)
             generation = info["generation"] + 1
             connection.execute(
                 "UPDATE pipelines SET generation=? WHERE name=?", (generation, pipeline)
@@ -134,18 +150,13 @@ class Engine:
                 ),
             )
         else:
-            transformed, dimension_version = self.operators.transform(
+            transformed, dimension_version = self.transform.apply(
                 connection, pipeline, row
             )
             if transformed is None:
                 disposition = "filtered"
-            elif self.operators.duplicate(connection, pipeline, transformed):
-                disposition = "duplicate"
             else:
-                disposition = "accepted"
-                self.windows.add(connection, pipeline, transformed)
-                self.operators.latest(connection, pipeline, transformed)
-                self.operators.sequence(connection, pipeline, transformed)
+                disposition = self._run_operators(connection, pipeline, transformed)
         connection.execute(
             "INSERT INTO processed_events VALUES (?,?,?,?,?,?)",
             (
@@ -165,6 +176,18 @@ class Engine:
             row["time"],
         )
         return disposition
+
+    def _run_operators(self, connection, pipeline, row):
+        for operator in self.operators.event_chain(pipeline["plan"]):
+            outcome = operator.process(connection, pipeline, row)
+            if outcome is None:
+                continue
+            if outcome not in EVENT_DISPOSITIONS:
+                raise Invalid(
+                    "operator " + operator.name + " returned an invalid disposition"
+                )
+            return outcome
+        return "accepted"
 
     def drain(self, pipeline, limit=1000, now_ms=None):
         dynamic_clock = now_ms is None

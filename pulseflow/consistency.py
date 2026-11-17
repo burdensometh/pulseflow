@@ -2,7 +2,6 @@ import json
 
 from .state import bucket_for
 from .values import canonical, fingerprint
-from .windows import starts_for
 
 
 class Consistency:
@@ -17,16 +16,24 @@ class Consistency:
             source = self.app.catalog.channel(channel, connection)
             self.check_source(connection, channel, source["partitions"], problems)
             self.check_progress(connection, info, problems)
-            self.check_membership(connection, info, problems)
+            self.check_states(connection, info, problems)
             self.check_results(connection, info, problems)
+            for operator in self.app.operators.applicable(info["plan"]):
+                operator.check(connection, info, problems)
+        return {"pipeline": pipeline, "ok": not problems, "problems": problems}
+
+    def check_states(self, connection, info, problems):
+        tables = self.app.operators.owned_tables(info["plan"])
+        for table, columns in tables.items():
+            if "bucket" not in columns or "group_key" not in columns:
+                continue
             for row in connection.execute(
-                "SELECT bucket,group_key FROM keyed_state WHERE pipeline=?", (pipeline,)
+                f"SELECT * FROM {table} WHERE pipeline=?", (info["name"],)
             ):
                 if row["bucket"] != bucket_for(
                     row["group_key"], info["buckets"], info["hash_version"]
                 ):
-                    problems.append("keyed state bucket mismatch: " + row["group_key"])
-        return {"pipeline": pipeline, "ok": not problems, "problems": problems}
+                    problems.append(f"{table} bucket mismatch: " + row["group_key"])
 
     def check_source(self, connection, channel, partitions, problems):
         for partition in range(partitions):
@@ -79,33 +86,6 @@ class Consistency:
             ]
             if offsets != list(range(progress["next_offset"])):
                 problems.append("processed partition offsets do not match progress")
-
-    def check_membership(self, connection, info, problems):
-        actual = {}
-        for row in connection.execute(
-            "SELECT * FROM window_events WHERE pipeline=?", (info["name"],)
-        ):
-            expected_bucket = bucket_for(
-                row["group_key"], info["buckets"], info["hash_version"]
-            )
-            if expected_bucket != row["bucket"]:
-                problems.append("window event is in the wrong state bucket")
-            actual.setdefault(row["event_id"], []).append(row["window_start"])
-        for row in connection.execute(
-            "SELECT * FROM processed_events WHERE pipeline=? AND disposition='accepted'",
-            (info["name"],),
-        ):
-            transformed = json.loads(row["transformed"])
-            expected = sorted(starts_for(transformed["time"], info["plan"]["window"]))
-            if sorted(actual.get(row["event_id"], [])) != expected:
-                problems.append("window membership mismatch for " + row["event_id"])
-        for row in connection.execute(
-            "SELECT * FROM window_status WHERE pipeline=?", (info["name"],)
-        ):
-            if row["status"] == "closed" and (
-                info["watermark"] is None or row["window_end"] > info["watermark"]
-            ):
-                problems.append("window closed ahead of watermark")
 
     def check_results(self, connection, info, problems):
         for row in connection.execute(

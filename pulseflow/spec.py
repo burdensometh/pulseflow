@@ -43,7 +43,8 @@ def sequence_spec(value):
     }
 
 
-def plan_spec(document):
+def plan_spec(document, extensions=None):
+    extensions = dict(extensions or {})
     require_keys(
         document,
         ["window"],
@@ -55,8 +56,24 @@ def plan_spec(document):
             "dimension",
             "sequence",
             "max_window_events",
-        ],
+        ]
+        + sorted(extensions),
     )
+    if not all(isinstance(name, str) and name for name in extensions):
+        raise Invalid("plan extension keys must be nonempty strings")
+    for name, validate in extensions.items():
+        if name in {
+            "mapping",
+            "metrics",
+            "delay_ms",
+            "dedup",
+            "dimension",
+            "sequence",
+            "max_window_events",
+          }:
+            raise Invalid("plan extension may not shadow a built-in key: " + name)
+        if not callable(validate):
+            raise Invalid("plan extension requires a validator: " + name)
     mapping = document.get("mapping", {})
     Mapping(mapping)
     metrics = document.get("metrics", ["count", "sum", "mean"])
@@ -98,4 +115,7 @@ def plan_spec(document):
             raise Invalid("dimension missing policy must be null, drop or error")
     if "sequence" in document:
         result["sequence"] = sequence_spec(document["sequence"])
+    for name, validate in extensions.items():
+        if name in document:
+            result[name] = validate(document[name])
     return result

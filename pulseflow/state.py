@@ -36,6 +36,16 @@ class KeyedState:
             (pipeline["name"], bucket, kind, key),
         )
 
+    def scan(self, connection, pipeline, kind):
+        rows = connection.execute(
+            "SELECT bucket,state_kind,group_key,document FROM keyed_state "
+            "WHERE pipeline=? AND state_kind=? ORDER BY bucket,group_key",
+            (pipeline["name"], kind),
+        )
+        return [
+            {**dict(row), "document": json.loads(row["document"])} for row in rows
+        ]
+
     def inspect(self, pipeline, kind=None):
         with self.catalog.transaction() as connection:
             self.catalog.pipeline(pipeline, connection)

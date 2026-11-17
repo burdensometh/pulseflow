@@ -68,42 +68,6 @@ CREATE TABLE IF NOT EXISTS progress (
  declared_time INTEGER,
  PRIMARY KEY(pipeline,partition_id)
 );
-CREATE TABLE IF NOT EXISTS window_events (
- pipeline TEXT NOT NULL REFERENCES pipelines(name),
- bucket INTEGER NOT NULL,
- window_start INTEGER NOT NULL,
- group_key TEXT NOT NULL,
- event_id TEXT NOT NULL,
- event_time INTEGER NOT NULL,
- value TEXT,
- document TEXT NOT NULL,
- PRIMARY KEY(pipeline,bucket,window_start,group_key,event_id)
-);
-CREATE TABLE IF NOT EXISTS window_status (
- pipeline TEXT NOT NULL REFERENCES pipelines(name),
- bucket INTEGER NOT NULL,
- window_start INTEGER NOT NULL,
- window_end INTEGER NOT NULL,
- group_key TEXT NOT NULL,
- status TEXT NOT NULL CHECK(status IN ('open','closed')),
- result_revision INTEGER,
- PRIMARY KEY(pipeline,bucket,window_start,group_key)
-);
-CREATE TABLE IF NOT EXISTS keyed_state (
- pipeline TEXT NOT NULL REFERENCES pipelines(name),
- bucket INTEGER NOT NULL,
- state_kind TEXT NOT NULL,
- group_key TEXT NOT NULL,
- document TEXT NOT NULL,
- PRIMARY KEY(pipeline,bucket,state_kind,group_key)
-);
-CREATE TABLE IF NOT EXISTS seen_keys (
- pipeline TEXT NOT NULL REFERENCES pipelines(name),
- dedup_key TEXT NOT NULL,
- expires_at INTEGER NOT NULL,
- event_id TEXT NOT NULL,
- PRIMARY KEY(pipeline,dedup_key)
-);
 CREATE TABLE IF NOT EXISTS late_events (
  pipeline TEXT NOT NULL REFERENCES pipelines(name),
  event_id TEXT NOT NULL,
@@ -218,6 +182,18 @@ class Catalog:
                 "INSERT OR IGNORE INTO system_identity VALUES (1,?)",
                 (uuid.uuid4().hex,),
             )
+
+    def install(self, statements):
+        """Apply DDL contributed by registered operators."""
+
+        statements = tuple(statements)
+        if not statements:
+            return
+        with self.transaction(True) as connection:
+            for statement in statements:
+                if not isinstance(statement, str) or not statement.strip():
+                    raise ValueError("operator DDL statements must be nonempty SQL")
+                connection.execute(statement)
 
     def identity(self):
         with self.transaction() as connection:
