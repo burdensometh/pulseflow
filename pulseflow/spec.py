@@ -14,6 +14,69 @@ METRICS = {
     "distinct",
 }
 
+IDLE_ALIASES = ("idle", "idle_partitions")
+IDLE_TIMEOUT_KEYS = (
+    "idle_timeout_ms",
+    "idle_partition_timeout_ms",
+    "idle_partition_ms",
+)
+IDLE_INNER_KEYS = ("timeout_ms",) + IDLE_TIMEOUT_KEYS + ("enabled",)
+
+
+def idle_spec(document):
+    """Normalize the accepted idle spellings to one canonical shape.
+
+    ``{"idle": {"timeout_ms": n}}`` is the canonical form; ``idle_partitions``
+    may be used in place of ``idle``, an integer in place of the object, and a
+    top-level ``idle_timeout_ms`` (or one of its aliases) is accepted too.
+    Returns ``None`` when idle handling is disabled (the default), otherwise
+    ``{"timeout_ms": n}``.  A timeout of zero is valid: a partition with no
+    pending records is retired as soon as its silence is observed on a later
+    processing-clock reading.
+    """
+
+    timeout = None
+    nested = None
+    for key in IDLE_ALIASES:
+        if key in document:
+            if nested is not None:
+                raise Invalid("idle is configured more than once")
+            nested = document[key]
+    if nested is not None:
+        if nested is False:
+            timeout = False
+        elif type(nested) is int:
+            timeout = integer(nested, "idle timeout", 0, 86400000)
+        elif isinstance(nested, dict):
+            require_keys(nested, [], list(IDLE_INNER_KEYS))
+            enabled = nested.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise Invalid("idle enabled must be boolean")
+            values = [nested[key] for key in IDLE_TIMEOUT_KEYS if key in nested]
+            if "timeout_ms" in nested:
+                values.insert(0, nested["timeout_ms"])
+            if len(values) > 1:
+                raise Invalid("idle timeout is configured more than once")
+            if enabled:
+                if not values:
+                    raise Invalid("idle timeout is required")
+                timeout = integer(values[0], "idle timeout", 0, 86400000)
+            else:
+                timeout = False
+        else:
+            raise Invalid("idle must be a timeout, an object or false")
+    for key in IDLE_TIMEOUT_KEYS:
+        if key in document:
+            value = integer(document[key], "idle timeout", 0, 86400000)
+            if timeout is False:
+                raise Invalid("idle is both disabled and configured")
+            if timeout is not None and timeout != value:
+                raise Invalid("idle timeout is configured more than once")
+            timeout = value
+    if timeout is None or timeout is False:
+        return None
+    return {"timeout_ms": timeout}
+
 
 def window_spec(value):
     require_keys(value, ["kind", "size_ms"], ["slide_ms", "offset_ms"])
@@ -55,6 +118,11 @@ def plan_spec(document):
             "dimension",
             "sequence",
             "max_window_events",
+            "idle",
+            "idle_partitions",
+            "idle_timeout_ms",
+            "idle_partition_timeout_ms",
+            "idle_partition_ms",
         ],
     )
     mapping = document.get("mapping", {})
@@ -98,4 +166,7 @@ def plan_spec(document):
             raise Invalid("dimension missing policy must be null, drop or error")
     if "sequence" in document:
         result["sequence"] = sequence_spec(document["sequence"])
+    idle = idle_spec(document)
+    if idle is not None:
+        result["idle"] = idle
     return result

@@ -17,6 +17,7 @@ class Consistency:
             source = self.app.catalog.channel(channel, connection)
             self.check_source(connection, channel, source["partitions"], problems)
             self.check_progress(connection, info, problems)
+            self.check_idle(connection, info, problems)
             self.check_membership(connection, info, problems)
             self.check_results(connection, info, problems)
             for row in connection.execute(
@@ -79,6 +80,27 @@ class Consistency:
             ]
             if offsets != list(range(progress["next_offset"])):
                 problems.append("processed partition offsets do not match progress")
+
+    def check_idle(self, connection, info, problems):
+        spec = info["plan"].get("idle")
+        rows = {
+            row["partition_id"]: dict(row)
+            for row in connection.execute(
+                "SELECT * FROM partition_activity WHERE pipeline=?", (info["name"],)
+            )
+        }
+        for partition, row in rows.items():
+            if row["idle"] and spec is None:
+                problems.append(f"idle partition {partition} without idle policy")
+            if row["idle"] and connection.execute(
+                "SELECT 1 FROM journal WHERE channel=? AND partition_id=? AND sequence>? LIMIT 1",
+                (info["channel"], partition, info["last_sequence"]),
+            ).fetchone():
+                problems.append(f"idle partition {partition} has unread records")
+            if row["idle_since_ms"] is not None and row["idle_since_ms"] < row[
+                "last_activity_ms"
+            ]:
+                problems.append(f"idle partition {partition} moved before its activity")
 
     def check_membership(self, connection, info, problems):
         actual = {}

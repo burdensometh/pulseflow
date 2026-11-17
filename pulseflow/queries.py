@@ -133,8 +133,18 @@ class Queries:
                 "WHERE p.pipeline=? AND s.channel=? ORDER BY p.partition_id",
                 (pipeline, info["channel"]),
             )
+            activity = {
+                row["partition_id"]: row
+                for row in self.app.watermarks.activity(connection, info)[
+                    "partitions"
+                ]
+            }
             return [
-                {**dict(row), "pending": row["ingested"] - row["processed"]}
+                {
+                    **dict(row),
+                    "pending": row["ingested"] - row["processed"],
+                    "idle": activity.get(row["partition_id"], {}).get("idle", False),
+                }
                 for row in rows
             ]
 

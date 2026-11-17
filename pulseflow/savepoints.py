@@ -17,6 +17,13 @@ from .values import (
 
 STATE_TABLES = {
     "progress": ["partition_id", "next_offset", "max_time", "declared_time"],
+    "partition_activity": [
+        "partition_id",
+        "last_activity_ms",
+        "idle_since_ms",
+        "idle",
+    ],
+    "pipeline_clocks": ["clock_ms"],
     "window_events": [
         "bucket",
         "window_start",
@@ -147,6 +154,11 @@ class Savepoints:
         integer(info["last_sequence"], "savepoint cursor", 0)
         integer(info["generation"], "savepoint generation", 0)
         state = document["state"]
+        # Older savepoints predate idle accounting; supplying empty sections
+        # keeps them loadable and simply re-arms the idle timers on restore.
+        if isinstance(state, dict):
+            for table in list(STATE_TABLES):
+                state.setdefault(table, [])
         if not isinstance(state, dict) or set(state) != set(STATE_TABLES):
             raise Invalid("savepoint state sections mismatch")
         total = 0
@@ -168,6 +180,13 @@ class Savepoints:
                 for field in ["document", "transformed"]:
                     if named.get(field) is not None:
                         json.loads(named[field])
+                if table == "partition_activity":
+                    integer(named["partition_id"], "activity partition", 0)
+                    integer(named["last_activity_ms"], "activity clock", 0)
+                    if named["idle_since_ms"] is not None:
+                        integer(named["idle_since_ms"], "idle clock", 0)
+                    if named["idle"] not in (0, 1):
+                        raise Invalid("savepoint idle flag is invalid")
         if total > 1000000:
             raise Invalid("savepoint row count exceeds limit")
         partitions = integer(
@@ -176,6 +195,11 @@ class Savepoints:
         actual = sorted(row[0] for row in state["progress"])
         if actual != list(range(partitions)):
             raise Invalid("savepoint partition progress is incomplete")
+        if len(state["pipeline_clocks"]) > 1:
+            raise Invalid("savepoint clock sections must contain at most one row")
+        active = sorted(row[0] for row in state["partition_activity"])
+        if active != sorted(set(active)) or set(active) - set(range(partitions)):
+            raise Invalid("savepoint activity partitions are invalid")
         return document
 
     def restore(self, document, destination, buckets=None):

@@ -71,17 +71,17 @@ class Engine:
             before = info["last_sequence"]
             counts = {"accepted": 0, "late": 0, "filtered": 0, "duplicate": 0}
             for record in records:
-                disposition = self.process(connection, info, record)
+                disposition = self.process(connection, info, record, now_ms)
                 counts[disposition] += 1
                 info["last_sequence"] = record["sequence"]
                 connection.execute(
                     "UPDATE pipelines SET last_sequence=? WHERE name=?",
                     (info["last_sequence"], pipeline),
                 )
-                self.watermarks.advance_in(connection, info)
+                self.watermarks.advance_in(connection, info, now_ms)
                 self.windows.close(connection, info)
                 self.operators.expire(connection, info)
-            self.watermarks.advance_in(connection, info)
+            self.watermarks.advance_in(connection, info, now_ms)
             closed = self.windows.close(connection, info)
             self.operators.expire(connection, info)
             generation = info["generation"] + 1
@@ -115,7 +115,7 @@ class Engine:
                 **details,
             }
 
-    def process(self, connection, pipeline, record):
+    def process(self, connection, pipeline, record, now_ms=None):
         row = record["document"]
         watermark = pipeline["watermark"]
         transformed = None
@@ -163,6 +163,7 @@ class Engine:
             record["partition_id"],
             record["source_offset"],
             row["time"],
+            now_ms,
         )
         return disposition
 

@@ -7,6 +7,7 @@ import unittest
 
 from pulseflow import PulseFlow
 from pulseflow.consumer import Consumer
+from pulseflow.spec import plan_spec
 from pulseflow.state import bucket_for
 from pulseflow.values import Conflict, Invalid, Missing, canonical
 from pulseflow.windows import starts_for
@@ -174,6 +175,271 @@ class FlowTest(unittest.TestCase):
         self.app.journal.append("two", "unread", [record(2, reading("unread", 60), 1)])
         with self.assertRaises(Conflict):
             self.app.watermarks.declare("twoflow", 1, 70)
+
+    def test_idle_partition_leaves_and_rejoins_watermark_coordination(self):
+        self.app.journal.create("devices", 2)
+        plan = copy.deepcopy(PLAN)
+        plan["idle"] = {"timeout_ms": 1000}
+        self.app.engine.create("idleflow", "devices", plan)
+        self.app.journal.append(
+            "devices",
+            "start",
+            [record(0, reading("a0", 0)), record(0, reading("b0", 0), 1)],
+        )
+        self.app.engine.drain("idleflow", now_ms=0)
+        self.assertEqual(self.app.watermarks.status("idleflow")["watermark"], 0)
+
+        # Device 0 keeps reporting far ahead while device 1 stays silent.
+        self.app.journal.append("devices", "fast", [record(1, reading("a1", 100))])
+        self.app.engine.drain("idleflow", now_ms=500)
+        status = self.app.watermarks.status("idleflow")
+        self.assertEqual(status["watermark"], 0)
+        self.assertEqual(status["idle_partitions"], [])
+
+        # Sustained silence past the timeout retires device 1, so the window
+        # belonging to device 0 closes.  Device 0 has to keep reporting; if it
+        # went silent too there would be nothing to anchor the watermark.
+        self.app.journal.append("devices", "fast2", [record(2, reading("a2", 200))])
+        self.app.engine.drain("idleflow", now_ms=1600)
+        status = self.app.watermarks.status("idleflow")
+        self.assertEqual(status["idle_partitions"], [1])
+        self.assertEqual(status["watermark"], 200)
+        self.assertTrue(self.app.results.rows("idleflow"))
+
+        # Device 1 resumes: an old record is late, a fresh one is computed,
+        # and the partition rejoins coordination immediately.
+        self.app.journal.append(
+            "devices",
+            "resume",
+            [record(1, reading("b-old", 50), 1), record(2, reading("b-new", 400), 1)],
+        )
+        self.app.engine.drain("idleflow", now_ms=1700)
+        status = self.app.watermarks.status("idleflow")
+        self.assertEqual(status["idle_partitions"], [])
+        self.assertEqual(
+            [row["event_id"] for row in self.app.engine.late("idleflow")], ["b-old"]
+        )
+        self.assertEqual(
+            self.app.queries.event("idleflow", "b-new")["processed"]["disposition"],
+            "accepted",
+        )
+        # The watermark is the minimum over *active* partitions, so it still
+        # waits for device 0's own event time (200), not the resumed 400.
+        self.assertEqual(status["watermark"], 200)
+        self.app.journal.append("devices", "ahead", [record(3, reading("a3", 500))])
+        self.app.engine.drain("idleflow", now_ms=1800)
+        self.assertGreaterEqual(
+            self.app.watermarks.status("idleflow")["watermark"], 400
+        )
+        self.assertTrue(self.app.consistency.check("idleflow")["ok"])
+
+    def test_idle_requires_no_backlog_and_never_advances_when_all_idle(self):
+        self.app.journal.create("devices", 2)
+        plan = copy.deepcopy(PLAN)
+        plan["idle"] = {"timeout_ms": 100}
+        self.app.engine.create("idleflow", "devices", plan)
+        self.app.journal.append(
+            "devices",
+            "start",
+            [record(0, reading("a0", 0)), record(0, reading("b0", 0), 1)],
+        )
+        self.app.engine.drain("idleflow", now_ms=0)
+
+        # Both partitions go silent: nothing may be invented.  The watermark
+        # holds at the last real value and no window closes on its own.
+        self.app.engine.drain("idleflow", now_ms=1000)
+        self.app.engine.drain("idleflow", now_ms=2000)
+        status = self.app.watermarks.status("idleflow")
+        self.assertEqual(status["idle_partitions"], [0, 1])
+        self.assertEqual(status["watermark"], 0)
+        self.assertEqual(self.app.results.rows("idleflow"), [])
+        self.assertEqual(self.app.windows.inspect("idleflow")[0]["status"], "open")
+
+        # Device 1 has an unread record: that is backlog, not silence.  Even
+        # with the processing clock far ahead it must stay in coordination.
+        self.app.journal.append(
+            "devices", "backlog", [record(1, reading("b1", 500), 1)]
+        )
+        status = self.app.watermarks.status("idleflow")
+        self.assertNotIn(1, status["idle_partitions"])
+        self.app.engine.drain("idleflow", now_ms=3000)
+        self.assertEqual(
+            self.app.queries.event("idleflow", "b1")["processed"]["disposition"],
+            "accepted",
+        )
+        self.assertTrue(self.app.consistency.check("idleflow")["ok"])
+
+    def test_idle_clock_rollback_and_restart_never_close_early(self):
+        self.app.journal.create("devices", 2)
+        plan = copy.deepcopy(PLAN)
+        plan["idle"] = {"timeout_ms": 1000}
+        self.app.engine.create("idleflow", "devices", plan)
+        self.app.journal.append(
+            "devices",
+            "start",
+            [record(0, reading("a0", 0)), record(0, reading("b0", 0), 1)],
+        )
+        self.app.engine.drain("idleflow", now_ms=0)
+        self.app.journal.append("devices", "fast", [record(1, reading("a1", 500))])
+        self.app.engine.drain("idleflow", now_ms=500)
+        self.assertEqual(self.app.watermarks.status("idleflow")["watermark"], 0)
+
+        # A fresh process reads the same catalog with the wall clock rolled
+        # back; the persisted monotonic clock must not be rewound, so device 1
+        # neither idles early nor lets the watermark jump backwards.
+        restarted = PulseFlow(self.home / "flow")
+        restarted.engine.drain("idleflow", now_ms=0)
+        status = restarted.watermarks.status("idleflow")
+        self.assertEqual(status["watermark"], 0)
+        self.assertEqual(status["idle_partitions"], [])
+
+        # Once the real clock catches up, idling proceeds normally.  Device 0
+        # keeps reporting so there is still an anchor for the watermark.
+        restarted.journal.append("devices", "fast2", [record(2, reading("a2", 500))])
+        restarted.engine.drain("idleflow", now_ms=1500)
+        status = restarted.watermarks.status("idleflow")
+        self.assertEqual(status["idle_partitions"], [1])
+        self.assertEqual(status["watermark"], 500)
+        self.assertTrue(restarted.consistency.check("idleflow")["ok"])
+
+    def test_idle_forward_clock_spike_cannot_close_windows_on_its_own(self):
+        self.app.journal.create("devices", 2)
+        plan = copy.deepcopy(PLAN)
+        plan["idle"] = {"timeout_ms": 1000}
+        self.app.engine.create("idleflow", "devices", plan)
+        self.app.journal.append(
+            "devices",
+            "start",
+            [record(0, reading("a0", 0)), record(0, reading("b0", 0), 1)],
+        )
+        self.app.engine.drain("idleflow", now_ms=0)
+
+        # A forward clock spike can retire the silent device, but the fast
+        # device's own event time still bounds the watermark: it may not jump
+        # to the clock, only to evidence the remaining partition provides.
+        self.app.journal.append("devices", "spike", [record(1, reading("a1", 100))])
+        self.app.engine.drain("idleflow", now_ms=10**9)
+        status = self.app.watermarks.status("idleflow")
+        self.assertEqual(status["idle_partitions"], [1])
+        self.assertEqual(status["watermark"], 100)
+
+        # With every partition silent nothing anchors the watermark, so a
+        # later clock advance leaves it exactly where the evidence put it.
+        self.app.engine.drain("idleflow", now_ms=2 * 10**9)
+        status = self.app.watermarks.status("idleflow")
+        self.assertEqual(status["idle_partitions"], [0, 1])
+        self.assertEqual(status["watermark"], 100)
+
+    def test_idle_restart_advances_only_on_real_evidence(self):
+        self.app.journal.create("devices", 2)
+        plan = copy.deepcopy(PLAN)
+        plan["idle"] = {"timeout_ms": 1000}
+        self.app.engine.create("idleflow", "devices", plan)
+        self.app.journal.append(
+            "devices",
+            "start",
+            [record(0, reading("a0", 0)), record(0, reading("b0", 0), 1)],
+        )
+        self.app.engine.drain("idleflow", now_ms=0)
+        self.app.journal.append("devices", "fast", [record(1, reading("a1", 100))])
+        self.app.engine.drain("idleflow", now_ms=500)
+
+        # A restart long after downtime finds both devices silent.  Silence is
+        # sustained past the timeout, so both may retire — but with nothing
+        # active there is no anchor and the watermark must freeze at the last
+        # evidence (0 here), never jump to the processing clock.  No window may
+        # close ahead of the data.
+        restarted = PulseFlow(self.home / "flow")
+        restarted.engine.drain("idleflow", now_ms=100000)
+        status = restarted.watermarks.status("idleflow")
+        self.assertEqual(status["idle_partitions"], [0, 1])
+        self.assertEqual(status["watermark"], 0)
+        self.assertTrue(restarted.consistency.check("idleflow")["ok"])
+        self.assertTrue(
+            all(
+                row["window_end"] <= 0
+                for row in restarted.windows.inspect("idleflow")
+                if row["status"] == "closed"
+            )
+        )
+
+        # Device 0 resumes reporting: it rejoins and the watermark follows its
+        # real event time again.
+        restarted.journal.append("devices", "resume", [record(2, reading("a2", 400))])
+        restarted.engine.drain("idleflow", now_ms=101000)
+        status = restarted.watermarks.status("idleflow")
+        self.assertEqual(status["idle_partitions"], [1])
+        self.assertEqual(status["watermark"], 400)
+
+    def test_idle_declare_reactivates_a_retired_partition(self):
+        self.app.journal.create("devices", 2)
+        plan = copy.deepcopy(PLAN)
+        plan["idle"] = {"timeout_ms": 100}
+        self.app.engine.create("idleflow", "devices", plan)
+        self.app.journal.append(
+            "devices",
+            "start",
+            [record(0, reading("a0", 0)), record(0, reading("b0", 0), 1)],
+        )
+        self.app.engine.drain("idleflow", now_ms=0)
+        self.app.journal.append("devices", "fast", [record(1, reading("a1", 100))])
+        self.app.engine.drain("idleflow", now_ms=500)
+        self.assertEqual(self.app.watermarks.status("idleflow")["idle_partitions"], [1])
+
+        # An explicit declaration is activity: the partition rejoins and the
+        # watermark waits for it again instead of skipping it as idle.  The
+        # watermark itself is monotonic, so it stays at 100 rather than
+        # retreating to the declared value.
+        self.app.watermarks.declare("idleflow", 1, 50)
+        status = self.app.watermarks.status("idleflow")
+        self.assertEqual(status["idle_partitions"], [])
+        self.assertEqual(status["watermark"], 100)
+        self.assertTrue(self.app.consistency.check("idleflow")["ok"])
+
+    def test_idle_state_survives_savepoint_and_restore(self):
+        self.app.journal.create("devices", 2)
+        plan = copy.deepcopy(PLAN)
+        plan["idle"] = {"timeout_ms": 1000}
+        self.app.engine.create("idleflow", "devices", plan)
+        self.app.journal.append(
+            "devices",
+            "start",
+            [record(0, reading("a0", 0)), record(0, reading("b0", 0), 1)],
+        )
+        self.app.engine.drain("idleflow", now_ms=0)
+        self.app.journal.append("devices", "fast", [record(1, reading("a1", 300))])
+        self.app.engine.drain("idleflow", now_ms=1500)
+        self.assertEqual(self.app.watermarks.status("idleflow")["idle_partitions"], [1])
+
+        point = self.app.savepoints.create("idleflow")
+        self.app.savepoints.restore_point(point["point_id"], "restored")
+        status = self.app.watermarks.status("restored")
+        self.assertEqual(status["idle_partitions"], [1])
+        self.assertEqual(status["watermark"], 300)
+        self.assertTrue(self.app.consistency.check("restored")["ok"])
+        self.assertTrue(self.app.replay.compare("idleflow", "restored")["equal"])
+
+    def test_idle_plan_spelling_validation(self):
+        base = {"window": {"kind": "tumbling", "size_ms": 10}}
+        for extra, timeout in [
+            ({"idle": 0}, 0),
+            ({"idle": {"timeout_ms": 5}}, 5),
+            ({"idle_timeout_ms": 5}, 5),
+            ({"idle_partitions": {"timeout_ms": 7}}, 7),
+        ]:
+            self.assertEqual(
+                plan_spec({**base, **extra})["idle"], {"timeout_ms": timeout}
+            )
+        for extra in [
+            {"idle": {}},
+            {"idle": True},
+            {"idle": {"timeout_ms": 5, "idle_timeout_ms": 6}},
+            {"idle": False, "idle_timeout_ms": 5},
+            {"idle": {"enabled": "yes", "timeout_ms": 5}},
+        ]:
+            with self.subTest(extra=extra), self.assertRaises(Invalid):
+                plan_spec({**base, **extra})
+        self.assertNotIn("idle", plan_spec(base))
 
     def test_mapping_dedup_latest_and_sequence_lifecycle(self):
         plan = copy.deepcopy(PLAN)

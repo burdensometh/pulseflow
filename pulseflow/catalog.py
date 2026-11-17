@@ -68,6 +68,18 @@ CREATE TABLE IF NOT EXISTS progress (
  declared_time INTEGER,
  PRIMARY KEY(pipeline,partition_id)
 );
+CREATE TABLE IF NOT EXISTS partition_activity (
+ pipeline TEXT NOT NULL REFERENCES pipelines(name),
+ partition_id INTEGER NOT NULL,
+ last_activity_ms INTEGER NOT NULL,
+ idle_since_ms INTEGER,
+ idle INTEGER NOT NULL DEFAULT 0 CHECK(idle IN (0,1)),
+ PRIMARY KEY(pipeline,partition_id)
+);
+CREATE TABLE IF NOT EXISTS pipeline_clocks (
+ pipeline TEXT PRIMARY KEY REFERENCES pipelines(name),
+ clock_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS window_events (
  pipeline TEXT NOT NULL REFERENCES pipelines(name),
  bucket INTEGER NOT NULL,
