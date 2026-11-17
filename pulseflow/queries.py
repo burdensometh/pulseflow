@@ -1,6 +1,7 @@
 from collections import Counter
 import json
 
+from .spec import plan_join_mode
 from .statistics import distribution, summarize, topk
 from .values import Missing, canonical, fingerprint
 
@@ -100,6 +101,11 @@ class Queries:
         with self.app.catalog.transaction() as connection:
             info = self.app.catalog.pipeline(pipeline, connection)
             if info["plan"].get("dimension", {}).get("name") != dimension:
+                return {"events": [], "windows": []}
+            if plan_join_mode(info["plan"]) == "knowledge":
+                # A pinned pipeline keeps a fixed knowledge cutoff, so a
+                # retroactively published revision cannot affect events it
+                # already accepted.
                 return {"events": [], "windows": []}
             sql = (
                 "SELECT p.event_id,j.event_time,p.dimension_version "

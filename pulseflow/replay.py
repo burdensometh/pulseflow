@@ -1,5 +1,6 @@
 from collections import Counter
 
+from .spec import call_knowledge_spec, normalize_join_mode
 from .values import Invalid, fingerprint
 
 
@@ -7,12 +8,36 @@ class Replay:
     def __init__(self, app):
         self.app = app
 
-    def fork(self, source, destination, plan=None, buckets=None):
+    def fork(
+        self,
+        source,
+        destination,
+        plan=None,
+        buckets=None,
+        knowledge=None,
+        mode=None,
+        **options,
+    ):
         original = self.app.catalog.pipeline(source)
+        plan = plan if plan is not None else original["plan"]
+        cutoff = call_knowledge_spec(knowledge, options)
+        if cutoff is not None or mode is not None:
+            if "dimension" not in plan:
+                raise Invalid("knowledge cutoff requires a dimension join plan")
+            dimension = dict(plan["dimension"])
+            if mode is not None:
+                dimension = {**dimension, "mode": mode}
+                if normalize_join_mode(mode) == "realtime" and cutoff is None:
+                    # Explicitly unpinning falls back to the historical
+                    # realtime join instead of rejecting the old cutoff.
+                    dimension.pop("knowledge", None)
+            if cutoff is not None:
+                dimension = {**dimension, "knowledge": cutoff}
+            plan = {**plan, "dimension": dimension}
         self.app.engine.create(
             destination,
             original["channel"],
-            plan if plan is not None else original["plan"],
+            plan,
             original["buckets"] if buckets is None else buckets,
         )
         result = self.app.engine.drain(destination)

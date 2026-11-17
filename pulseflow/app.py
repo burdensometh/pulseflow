@@ -40,6 +40,7 @@ class PulseFlow:
             self.windows,
             self.operators,
             self.leases,
+            self.dimensions,
         )
         self.artifacts = Artifacts(self.home / "artifacts")
         self.savepoints = Savepoints(self.catalog, self.journal, self.artifacts)

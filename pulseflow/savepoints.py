@@ -141,6 +141,13 @@ class Savepoints:
         plan = plan_spec(info["plan"])
         if fingerprint(plan) != info["plan_hash"]:
             raise Conflict("savepoint plan fingerprint mismatch")
+        knowledge = plan.get("dimension", {}).get("knowledge")
+        if knowledge is not None:
+            # A restored pipeline must keep a concrete knowledge cutoff, so
+            # the savepoint may not smuggle in a late-resolving head/batch.
+            if set(knowledge) != {"version"}:
+                raise Invalid("savepoint dimension knowledge cutoff is not resolved")
+            integer(knowledge["version"], "savepoint knowledge cutoff", 0)
         buckets = integer(info["buckets"], "savepoint state buckets", 1, 128)
         if info["hash_version"] != 1:
             raise Invalid("unsupported savepoint state hash")

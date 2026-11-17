@@ -41,6 +41,7 @@ print(app.results.rows('windows'))
 - 处理顺序使用持久源日志的 sequence，每个 chunk 的源进度、算子状态、水位、结果和变更流一起提交。任一转换错误使整个 chunk 回滚；当前不支持按故障分区隔离，也没有自动修复事件。
 - Worker 使用租约与递增 fence；过期或被替代的 worker 不能提交。状态按 Adler32(key) mod buckets 分桶，当前 hash_version=1；分桶影响窗口与键状态的实际读写路径。
 - 维度按 valid_from 左闭区间解释，同一 valid_from 取最高 revision，删除版本阻止回退到更早值。事件在处理时按自己的事件时间关联维度。后来补发的历史维度更正不会自动重算已处理事件和已发布结果。
+- 维度关联有两种模式。默认 `realtime` 在处理每个 chunk 时读取当时最新的维度知识，因此同一读数分块处理时，中途补发的修订会改变后续 chunk 的关联（这正是本模式的历史语义）。可选 `knowledge` 模式在计划中固定一个知识截点，例如 `{"dimension": {"name": "stations", "knowledge": {"batch": "base"}}}`、`{"knowledge": 7}`（version_id）、`{"knowledge": {"head": true}}`（创建时的知识头）或等价的 `knowledge_version`/`knowledge_batch` 写法；`mode` 可取 `realtime`/`latest` 或 `knowledge`/`asof`，缺省 `mode` 时给出任一截点即视为 `knowledge`。截点在 `engine.create`/`replay.fork`/HTTP `/pipelines`、`/replay` 的写事务内解析为具体且不可变的 version_id，此后所有 chunk、保存点恢复和同计划 replay 都只读取 `version_id<=cutoff` 的版本，因此相同读数、计划与截点可重复得到相同结果。截点仍按事件有效时间选择版本，同一 valid_from 的最高 revision 与删除版本优先级不变；被截点排除的修订或删除不影响结果，显式更小的截点可另建管道/回放对比。`dimensions.publish` 返回的 `cutoff` 即该批次提交时的知识头，可用于后续 `knowledge` 截点。
 - 去重基于事件时间 TTL，不更改源位点；null 去重字段不参与。最近值按 (event_time,event_id) 裁决。A→B 序列匹配使用每键最新 A，一次匹配消费该 A；它不是全重叠模式匹配器。
 - 结果按 key 保留单调 revision，变更流是 upsert/delete；独立 Consumer 将数据和 cursor 事务提交，并绑定真实源实例及计划身份。不可变 JSONL/CSV 导出保留当时结果。
 - Rollup 消费同一变更流，将已关闭窗口按 key-to-group 映射汇总；替换/删除输入会撤回旧贡献。当前每次从缓存输入重建汇总结果，且输出与 rollup cursor 在同一目录事务中提交。

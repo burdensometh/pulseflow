@@ -4,6 +4,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import json
 import threading
 
+from .spec import CUTOFF_KEYS
 from .values import Conflict, Invalid, Missing, canonical, millis
 
 
@@ -17,6 +18,17 @@ def query_integer(query, name, default=None):
         return int(values[0])
     except ValueError as error:
         raise Invalid("query parameter must be integer: " + name) from error
+
+
+def cutoff_options(body):
+    """Plan-level cutoff aliases accepted from an HTTP request body."""
+    return {
+        key: body[key]
+        for key in CUTOFF_KEYS
+        if key in body
+        and body[key] is not None
+        and key not in {"knowledge", "mode", "version", "batch", "head"}
+    }
 
 
 class API:
@@ -36,7 +48,13 @@ class API:
             return app.journal.append(parts[1], body["batch_id"], body["records"])
         if parts == ["pipelines"]:
             return app.engine.create(
-                body["name"], body["channel"], body["plan"], body.get("buckets", 4)
+                body["name"],
+                body["channel"],
+                body["plan"],
+                body.get("buckets", 4),
+                body.get("knowledge"),
+                body.get("mode"),
+                **cutoff_options(body),
             )
         if len(parts) == 3 and parts[0] == "pipelines":
             return self.pipeline_action(parts[1], parts[2], body)
@@ -66,6 +84,9 @@ class API:
                 body["destination"],
                 body.get("plan"),
                 body.get("buckets"),
+                body.get("knowledge"),
+                body.get("mode"),
+                **cutoff_options(body),
             )
         raise Missing("operation does not exist")
 
@@ -132,7 +153,18 @@ class API:
         if len(parts) == 3 and parts[0] == "dimensions":
             if "at" not in query or len(query["at"]) != 1:
                 raise Invalid("dimension lookup requires exactly one at parameter")
-            return app.dimensions.lookup(parts[1], parts[2], int(query["at"][0]))
+            knowledge = [value for value in query.get("knowledge", [])]
+            if len(knowledge) > 1:
+                raise Invalid("dimension knowledge cutoff may only appear once")
+            cutoff = None
+            if knowledge:
+                try:
+                    cutoff = int(knowledge[0])
+                except ValueError:
+                    cutoff = knowledge[0]
+            return app.dimensions.lookup(
+                parts[1], parts[2], int(query["at"][0]), cutoff=cutoff
+            )
         if len(parts) == 2 and parts[0] == "savepoints":
             return app.savepoints.get(parts[1])
         if len(parts) == 2 and parts[0] == "rollups":

@@ -162,6 +162,10 @@ CREATE TABLE IF NOT EXISTS dimension_receipts (
  fingerprint TEXT NOT NULL,
  versions TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS dimension_knowledge (
+ batch_id TEXT PRIMARY KEY,
+ cutoff INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS engine_runs (
  run_id TEXT PRIMARY KEY,
  pipeline TEXT NOT NULL,

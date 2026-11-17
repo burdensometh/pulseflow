@@ -19,6 +19,7 @@ class Consistency:
             self.check_progress(connection, info, problems)
             self.check_membership(connection, info, problems)
             self.check_results(connection, info, problems)
+            self.check_knowledge(connection, info, problems)
             for row in connection.execute(
                 "SELECT bucket,group_key FROM keyed_state WHERE pipeline=?", (pipeline,)
             ):
@@ -106,6 +107,31 @@ class Consistency:
                 info["watermark"] is None or row["window_end"] > info["watermark"]
             ):
                 problems.append("window closed ahead of watermark")
+
+    def check_knowledge(self, connection, info, problems):
+        """A pinned join may only cite versions inside its stored cutoff."""
+        knowledge = info["plan"].get("dimension", {}).get("knowledge")
+        if knowledge is None:
+            return
+        cutoff = knowledge.get("version")
+        if cutoff is None:
+            problems.append("dimension knowledge cutoff is not resolved")
+            return
+        head = connection.execute(
+            "SELECT coalesce(max(version_id),0) FROM dimension_versions"
+        ).fetchone()[0]
+        if cutoff > head:
+            problems.append("dimension knowledge cutoff exceeds catalog knowledge")
+        for row in connection.execute(
+            "SELECT event_id,dimension_version FROM processed_events "
+            "WHERE pipeline=? AND dimension_version IS NOT NULL",
+            (info["name"],),
+        ):
+            if row["dimension_version"] > cutoff:
+                problems.append(
+                    "event cites dimension knowledge beyond its cutoff: "
+                    + row["event_id"]
+                )
 
     def check_results(self, connection, info, problems):
         for row in connection.execute(
