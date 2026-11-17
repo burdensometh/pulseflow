@@ -1,10 +1,17 @@
 from contextlib import contextmanager
+from decimal import Decimal
 from pathlib import Path
 import json
 import sqlite3
 import uuid
 
 from .values import Missing, canonical, utc_now
+
+
+def compare_decimal(left, right):
+    """Numeric ordering over canonical decimal text for exact window ranks."""
+    first, second = Decimal(left), Decimal(right)
+    return (first > second) - (first < second)
 
 
 DDL = """
@@ -229,6 +236,7 @@ class Catalog:
         connection = sqlite3.connect(self.path, timeout=20, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.create_collation("decimal_exact", compare_decimal)
         return connection
 
     @contextmanager

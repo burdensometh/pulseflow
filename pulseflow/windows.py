@@ -1,8 +1,9 @@
 import json
+from decimal import localcontext
 
 from .state import bucket_for
-from .statistics import summarize
-from .values import Invalid, canonical
+from .statistics import RunningTotals, rank_for, render_metrics, summarize
+from .values import Invalid, canonical, decimal_text
 
 
 def starts_for(event_time, spec):
@@ -17,6 +18,15 @@ def starts_for(event_time, spec):
 
 
 class Windows:
+    """Window assignment and exact closing aggregation.
+
+    Every accepted event is persisted in the catalog, so window state already
+    lives on disk. ``max_window_events`` is the in-memory record budget, not a
+    capacity limit: closing streams a window back in chunks of at most that
+    many rows and pushes exact distinct/quantile work into disk-backed SQL, so
+    windows larger than the budget spill to disk instead of being rejected.
+    """
+
     def __init__(self, catalog, results):
         self.catalog = catalog
         self.results = results
@@ -31,12 +41,6 @@ class Windows:
             ).fetchone()
             if old and old["status"] != "open":
                 raise Invalid("event cannot update a closed window")
-            count = connection.execute(
-                "SELECT count(*) FROM window_events WHERE pipeline=? AND bucket=? AND window_start=? AND group_key=?",
-                (pipeline["name"], bucket, start, row["key"]),
-            ).fetchone()[0]
-            if count >= pipeline["plan"]["max_window_events"]:
-                raise Invalid("window event capacity exceeded")
             connection.execute(
                 "INSERT OR IGNORE INTO window_status VALUES (?,?,?,?,?,?,?)",
                 (
@@ -70,6 +74,76 @@ class Windows:
         )
         return [json.loads(row[0]) for row in rows]
 
+    def value_chunks(self, connection, pipeline, bucket, start, key, budget):
+        """Yield one window's stored values in chunks of at most `budget` rows.
+
+        Rows stream in the same order rows_in used, so the exact running sum
+        matches a full in-memory computation bit for bit, while at most
+        `budget` rows are held in a Python collection at any time.
+        """
+        cursor = connection.execute(
+            "SELECT value FROM window_events WHERE pipeline=? AND bucket=? AND window_start=? AND group_key=? ORDER BY event_time,event_id",
+            (pipeline, bucket, start, key),
+        )
+        while True:
+            chunk = cursor.fetchmany(budget)
+            if not chunk:
+                return
+            yield chunk
+
+    def metrics_for(self, connection, pipeline, bucket, start, key):
+        """Exact window metrics reading at most max_window_events rows at once."""
+        plan = pipeline["plan"]
+        metrics = plan["metrics"]
+        totals = RunningTotals()
+        with localcontext() as context:
+            context.prec = 76
+            for chunk in self.value_chunks(
+                connection,
+                pipeline["name"],
+                bucket,
+                start,
+                key,
+                plan["max_window_events"],
+            ):
+                for row in chunk:
+                    totals.add(row[0])
+        distinct = None
+        if "distinct" in metrics:
+            distinct = connection.execute(
+                "SELECT COUNT(DISTINCT value) FROM window_events "
+                "WHERE pipeline=? AND bucket=? AND window_start=? AND group_key=? AND value IS NOT NULL",
+                (pipeline["name"], bucket, start, key),
+            ).fetchone()[0]
+
+        def percentile_at(numerator):
+            if totals.count_value == 0:
+                return None
+            row = connection.execute(
+                "SELECT value FROM window_events "
+                "WHERE pipeline=? AND bucket=? AND window_start=? AND group_key=? AND value IS NOT NULL "
+                "ORDER BY value COLLATE decimal_exact LIMIT 1 OFFSET ?",
+                (
+                    pipeline["name"],
+                    bucket,
+                    start,
+                    key,
+                    rank_for(totals.count_value, numerator) - 1,
+                ),
+            ).fetchone()
+            return decimal_text(row[0])
+
+        return render_metrics(
+            metrics,
+            totals.count,
+            totals.count_value,
+            totals.total,
+            totals.minimum,
+            totals.maximum,
+            distinct,
+            percentile_at,
+        )
+
     def close(self, connection, pipeline):
         if pipeline["watermark"] is None:
             return 0
@@ -78,19 +152,18 @@ class Windows:
             (pipeline["name"], pipeline["watermark"]),
         ).fetchall()
         for state in rows:
-            events = self.rows_in(
-                connection,
-                pipeline["name"],
-                state["bucket"],
-                state["window_start"],
-                state["group_key"],
-            )
             document = {
                 "kind": "window",
                 "key": state["group_key"],
                 "start": state["window_start"],
                 "end": state["window_end"],
-                "metrics": summarize(events, pipeline["plan"]["metrics"]),
+                "metrics": self.metrics_for(
+                    connection,
+                    pipeline,
+                    state["bucket"],
+                    state["window_start"],
+                    state["group_key"],
+                ),
             }
             key = canonical(
                 [

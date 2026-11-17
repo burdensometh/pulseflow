@@ -69,7 +69,7 @@ def plan_spec(document):
         raise Invalid("invalid aggregate metrics")
     delay = integer(document.get("delay_ms", 0), "watermark delay", 0, 86400000)
     maximum = integer(
-        document.get("max_window_events", 100000), "window event limit", 1, 1000000
+        document.get("max_window_events", 100000), "window memory budget", 1, 1000000
     )
     result = {
         "window": window_spec(document["window"]),
