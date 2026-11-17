@@ -13,6 +13,9 @@ class Consistency:
         problems = []
         with self.app.catalog.transaction() as connection:
             info = self.app.catalog.pipeline(pipeline, connection)
+            if "join" in info["plan"]:
+                self.check_join(connection, info, problems)
+                return {"pipeline": pipeline, "ok": not problems, "problems": problems}
             channel = info["channel"]
             source = self.app.catalog.channel(channel, connection)
             self.check_source(connection, channel, source["partitions"], problems)
@@ -27,6 +30,92 @@ class Consistency:
                 ):
                     problems.append("keyed state bucket mismatch: " + row["group_key"])
         return {"pipeline": pipeline, "ok": not problems, "problems": problems}
+
+    def check_join(self, connection, info, problems):
+        spec = info["plan"]["join"]
+        for side in ("left", "right"):
+            channel = spec[side + "_channel"]
+            source = self.app.catalog.channel(channel, connection)
+            self.check_source(connection, channel, source["partitions"], problems)
+        self.check_join_progress(connection, info, spec, problems)
+        self.check_join_buffers(connection, info, spec, problems)
+        self.check_results(connection, info, problems)
+
+    def check_join_progress(self, connection, info, spec, problems):
+        seen = list(
+            connection.execute(
+                "SELECT p.*,j.channel,j.partition_id,j.source_offset "
+                "FROM processed_events p "
+                "LEFT JOIN journal j ON p.source_sequence=j.sequence "
+                "WHERE p.pipeline=? ORDER BY p.source_sequence",
+                (info["name"],),
+            )
+        )
+        maximum = max((row["source_sequence"] for row in seen), default=0)
+        if maximum != info["last_sequence"]:
+            problems.append("pipeline cursor does not match processed prefix")
+        expected_count = connection.execute(
+            "SELECT count(*) FROM journal WHERE channel IN (?,?) AND sequence<=?",
+            (spec["left_channel"], spec["right_channel"], info["last_sequence"]),
+        ).fetchone()[0]
+        if expected_count != len(seen):
+            problems.append("processed event prefix is incomplete")
+        marks = {}
+        for row in connection.execute(
+            "SELECT side,watermark FROM join_sides WHERE pipeline=?", (info["name"],)
+        ):
+            marks[row["side"]] = row["watermark"]
+        if set(marks) != {"left", "right"}:
+            problems.append("join side watermarks are incomplete")
+        elif None in marks.values():
+            if info["watermark"] is not None:
+                problems.append("pipeline watermark ahead of a join side")
+        elif info["watermark"] != min(marks.values()):
+            problems.append("pipeline watermark does not match join side watermarks")
+        for progress in connection.execute(
+            "SELECT * FROM join_progress WHERE pipeline=?", (info["name"],)
+        ):
+            channel = spec[progress["side"] + "_channel"]
+            offsets = [
+                row["source_offset"]
+                for row in seen
+                if row["channel"] == channel
+                and row["partition_id"] == progress["partition_id"]
+            ]
+            if offsets != list(range(progress["next_offset"])):
+                problems.append("processed join partition offsets do not match progress")
+
+    def check_join_buffers(self, connection, info, spec, problems):
+        marks = {
+            row["side"]: row["watermark"]
+            for row in connection.execute(
+                "SELECT side,watermark FROM join_sides WHERE pipeline=?", (info["name"],)
+            )
+        }
+        for row in connection.execute(
+            "SELECT * FROM join_buffers WHERE pipeline=?", (info["name"],)
+        ):
+            expected_bucket = bucket_for(
+                row["group_key"], info["buckets"], info["hash_version"]
+            )
+            if expected_bucket != row["bucket"]:
+                problems.append("join buffer is in the wrong state bucket")
+            if row["matched"] not in (0, 1):
+                problems.append("join buffer matched flag is invalid")
+            if row["side"] == "left":
+                if (
+                    marks.get("right") is not None
+                    and row["event_time"] + spec["after_ms"] <= marks["right"]
+                ):
+                    problems.append("left join state survived past the right watermark")
+            else:
+                if row["matched"]:
+                    problems.append("right join state must not be marked matched")
+                if (
+                    marks.get("left") is not None
+                    and row["event_time"] + spec["before_ms"] < marks["left"]
+                ):
+                    problems.append("right join state survived past the left watermark")
 
     def check_source(self, connection, channel, partitions, problems):
         for partition in range(partitions):

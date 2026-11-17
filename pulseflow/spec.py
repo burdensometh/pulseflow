@@ -43,7 +43,40 @@ def sequence_spec(value):
     }
 
 
+def join_spec(value):
+    require_keys(
+        value,
+        ["left_channel", "right_channel", "before_ms", "after_ms"],
+        ["outer", "delay_ms", "max_buffer_events"],
+    )
+    left = identifier(value["left_channel"], "left join channel")
+    right = identifier(value["right_channel"], "right join channel")
+    if left == right:
+        raise Invalid("join channels must differ")
+    before = integer(value["before_ms"], "join lookback", 0, 86400000)
+    after = integer(value["after_ms"], "join lookahead", 0, 86400000)
+    if before + after < 1:
+        raise Invalid("join interval must span at least one millisecond")
+    outer = value.get("outer", False)
+    if type(outer) is not bool:
+        raise Invalid("join outer flag must be boolean")
+    return {
+        "left_channel": left,
+        "right_channel": right,
+        "before_ms": before,
+        "after_ms": after,
+        "outer": outer,
+        "delay_ms": integer(value.get("delay_ms", 0), "watermark delay", 0, 86400000),
+        "max_buffer_events": integer(
+            value.get("max_buffer_events", 100000), "join buffer limit", 1, 1000000
+        ),
+    }
+
+
 def plan_spec(document):
+    if isinstance(document, dict) and "join" in document:
+        require_keys(document, ["join"])
+        return {"join": join_spec(document["join"])}
     require_keys(
         document,
         ["window"],

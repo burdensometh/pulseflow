@@ -74,6 +74,11 @@ class API:
         if action == "run":
             return app.engine.drain(name, body.get("limit", 1000))
         if action == "declare":
+            info = app.catalog.pipeline(name)
+            if "join" in info["plan"]:
+                return app.joins.declare(
+                    name, body.get("side"), body["partition"], millis(body["time"])
+                )
             return app.watermarks.declare(name, body["partition"], millis(body["time"]))
         if action == "savepoint":
             return app.savepoints.create(name, body.get("compressed", False))
@@ -114,6 +119,9 @@ class API:
             if action == "late":
                 return app.engine.late(name)
             if action == "watermark":
+                info = app.catalog.pipeline(name)
+                if "join" in info["plan"]:
+                    return app.joins.status(name)
                 return app.watermarks.status(name)
             if action == "windows":
                 return app.windows.inspect(

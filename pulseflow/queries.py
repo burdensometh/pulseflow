@@ -12,6 +12,8 @@ class Queries:
     def event(self, pipeline, event_id):
         with self.app.catalog.transaction() as connection:
             info = self.app.catalog.pipeline(pipeline, connection)
+            if "join" in info["plan"]:
+                return self.join_event(connection, info, event_id)
             source = connection.execute(
                 "SELECT * FROM journal WHERE channel=? AND event_id=?",
                 (info["channel"], event_id),
@@ -40,6 +42,37 @@ class Queries:
                 "windows": memberships,
                 "rejection_watermark": late[0] if late else None,
             }
+
+    def join_event(self, connection, info, event_id):
+        from .joins import split_qualified
+
+        side, raw = split_qualified(event_id)
+        channel = info["plan"]["join"][side + "_channel"]
+        source = connection.execute(
+            "SELECT * FROM journal WHERE channel=? AND event_id=?",
+            (channel, raw),
+        ).fetchone()
+        if source is None:
+            raise Missing("source event does not exist")
+        processed = connection.execute(
+            "SELECT * FROM processed_events WHERE pipeline=? AND event_id=?",
+            (info["name"], event_id),
+        ).fetchone()
+        buffered = connection.execute(
+            "SELECT side,bucket,group_key,event_time,matched FROM join_buffers "
+            "WHERE pipeline=? AND side=? AND event_id=?",
+            (info["name"], side, raw),
+        ).fetchone()
+        late = connection.execute(
+            "SELECT watermark FROM late_events WHERE pipeline=? AND event_id=?",
+            (info["name"], event_id),
+        ).fetchone()
+        return {
+            "source": {**dict(source), "document": json.loads(source["document"])},
+            "processed": dict(processed) if processed else None,
+            "buffered": dict(buffered) if buffered else None,
+            "rejection_watermark": late[0] if late else None,
+        }
 
     def accepted(self, pipeline, key=None):
         with self.app.catalog.transaction() as connection:
@@ -126,6 +159,21 @@ class Queries:
     def lag(self, pipeline):
         with self.app.catalog.transaction() as connection:
             info = self.app.catalog.pipeline(pipeline, connection)
+            if "join" in info["plan"]:
+                rows = connection.execute(
+                    "SELECT p.side,p.partition_id,p.next_offset AS processed,"
+                    "s.next_offset AS ingested,p.max_time,p.declared_time "
+                    "FROM join_progress p "
+                    "JOIN join_sides js ON js.pipeline=p.pipeline AND js.side=p.side "
+                    "JOIN source_positions s "
+                    "ON s.channel=js.channel AND s.partition_id=p.partition_id "
+                    "WHERE p.pipeline=? ORDER BY p.side,p.partition_id",
+                    (pipeline,),
+                )
+                return [
+                    {**dict(row), "pending": row["ingested"] - row["processed"]}
+                    for row in rows
+                ]
             rows = connection.execute(
                 "SELECT p.partition_id,p.next_offset AS processed,s.next_offset AS ingested,"
                 "p.max_time,p.declared_time FROM progress p "

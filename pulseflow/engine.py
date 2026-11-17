@@ -5,6 +5,7 @@ import uuid
 from .spec import plan_spec
 from .values import (
     Conflict,
+    Invalid,
     canonical,
     fingerprint,
     identifier,
@@ -14,13 +15,14 @@ from .values import (
 
 
 class Engine:
-    def __init__(self, catalog, journal, watermarks, windows, operators, leases):
+    def __init__(self, catalog, journal, watermarks, windows, operators, leases, joins):
         self.catalog = catalog
         self.journal = journal
         self.watermarks = watermarks
         self.windows = windows
         self.operators = operators
         self.leases = leases
+        self.joins = joins
 
     def create(self, name, channel, plan, buckets=4):
         name = identifier(name)
@@ -28,6 +30,8 @@ class Engine:
         plan = plan_spec(plan)
         checksum = fingerprint(plan)
         with self.catalog.transaction(True) as connection:
+            if "join" in plan and channel != plan["join"]["left_channel"]:
+                raise Invalid("join pipeline channel must be the left join channel")
             source = self.catalog.channel(channel, connection)
             old = connection.execute(
                 "SELECT * FROM pipelines WHERE name=?", (name,)
@@ -46,10 +50,13 @@ class Engine:
                 "INSERT INTO pipelines VALUES (?,?,?,?,?,?,NULL,0,0,?)",
                 (name, channel, canonical(plan), checksum, buckets, 1, utc_now()),
             )
-            connection.executemany(
-                "INSERT INTO progress VALUES (?,?,0,NULL,NULL)",
-                ((name, p) for p in range(source["partitions"])),
-            )
+            if "join" in plan:
+                self.joins.initialize(connection, name, plan["join"])
+            else:
+                connection.executemany(
+                    "INSERT INTO progress VALUES (?,?,0,NULL,NULL)",
+                    ((name, p) for p in range(source["partitions"])),
+                )
             self.catalog.event(
                 connection,
                 name,
@@ -65,25 +72,47 @@ class Engine:
         with self.catalog.transaction(True) as connection:
             self.leases.check(connection, lease, now_ms)
             info = self.catalog.pipeline(pipeline, connection)
-            records = self.journal.read(
-                info["channel"], info["last_sequence"], limit, connection=connection
-            )
+            join = "join" in info["plan"]
+            if join:
+                self.joins.load(connection, info)
+                records = self.joins.read_inputs(connection, info, limit)
+            else:
+                records = self.journal.read(
+                    info["channel"], info["last_sequence"], limit, connection=connection
+                )
             before = info["last_sequence"]
             counts = {"accepted": 0, "late": 0, "filtered": 0, "duplicate": 0}
+            finalized = {"unmatched": 0, "expired_left": 0, "expired_right": 0}
             for record in records:
-                disposition = self.process(connection, info, record)
+                if join:
+                    disposition = self.joins.process(connection, info, record)
+                else:
+                    disposition = self.process(connection, info, record)
                 counts[disposition] += 1
                 info["last_sequence"] = record["sequence"]
                 connection.execute(
                     "UPDATE pipelines SET last_sequence=? WHERE name=?",
                     (info["last_sequence"], pipeline),
                 )
+                if join:
+                    self.joins.advance(connection, info)
+                    step_done = self.joins.finalize(connection, info)
+                    for key, value in step_done.items():
+                        finalized[key] += value
+                else:
+                    self.watermarks.advance_in(connection, info)
+                    self.windows.close(connection, info)
+                    self.operators.expire(connection, info)
+            if join:
+                self.joins.advance(connection, info)
+                step_done = self.joins.finalize(connection, info)
+                for key, value in step_done.items():
+                    finalized[key] += value
+                closed = 0
+            else:
                 self.watermarks.advance_in(connection, info)
-                self.windows.close(connection, info)
+                closed = self.windows.close(connection, info)
                 self.operators.expire(connection, info)
-            self.watermarks.advance_in(connection, info)
-            closed = self.windows.close(connection, info)
-            self.operators.expire(connection, info)
             generation = info["generation"] + 1
             connection.execute(
                 "UPDATE pipelines SET generation=? WHERE name=?", (generation, pipeline)
@@ -94,6 +123,9 @@ class Engine:
                 "watermark": info["watermark"],
                 "windows_closed_at_flush": closed,
             }
+            if join:
+                details["join_watermarks"] = dict(info["join_watermarks"])
+                details.update(finalized)
             connection.execute(
                 "INSERT INTO engine_runs VALUES (?,?,?,?,?,?,?)",
                 (
@@ -191,9 +223,16 @@ class Engine:
     def status(self, pipeline):
         with self.catalog.transaction() as connection:
             info = self.catalog.pipeline(pipeline, connection)
-            source_count = connection.execute(
-                "SELECT count(*) FROM journal WHERE channel=?", (info["channel"],)
-            ).fetchone()[0]
+            if "join" in info["plan"]:
+                spec = info["plan"]["join"]
+                source_count = connection.execute(
+                    "SELECT count(*) FROM journal WHERE channel IN (?,?)",
+                    (spec["left_channel"], spec["right_channel"]),
+                ).fetchone()[0]
+            else:
+                source_count = connection.execute(
+                    "SELECT count(*) FROM journal WHERE channel=?", (info["channel"],)
+                ).fetchone()[0]
             processed = connection.execute(
                 "SELECT disposition,count(*) FROM processed_events WHERE pipeline=? GROUP BY disposition",
                 (pipeline,),

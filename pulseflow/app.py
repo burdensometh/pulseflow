@@ -7,6 +7,7 @@ from .dimensions import Dimensions
 from .engine import Engine
 from .exchange import JournalExchange
 from .exports import Exports
+from .joins import Joins
 from .journal import Journal
 from .operators import Operators
 from .queries import Queries
@@ -33,6 +34,7 @@ class PulseFlow:
         self.watermarks = Watermarks(self.catalog)
         self.windows = Windows(self.catalog, self.results)
         self.operators = Operators(self.state, self.dimensions, self.results)
+        self.joins = Joins(self.catalog, self.results)
         self.engine = Engine(
             self.catalog,
             self.journal,
@@ -40,7 +42,9 @@ class PulseFlow:
             self.windows,
             self.operators,
             self.leases,
+            self.joins,
         )
+        self.joins.engine = self.engine
         self.artifacts = Artifacts(self.home / "artifacts")
         self.savepoints = Savepoints(self.catalog, self.journal, self.artifacts)
         self.exports = Exports(self.catalog, self.results, self.artifacts)

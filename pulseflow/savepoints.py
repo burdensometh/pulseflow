@@ -36,6 +36,23 @@ STATE_TABLES = {
     ],
     "keyed_state": ["bucket", "state_kind", "group_key", "document"],
     "seen_keys": ["dedup_key", "expires_at", "event_id"],
+    "join_sides": ["side", "channel", "watermark"],
+    "join_progress": [
+        "side",
+        "partition_id",
+        "next_offset",
+        "max_time",
+        "declared_time",
+    ],
+    "join_buffers": [
+        "side",
+        "bucket",
+        "group_key",
+        "event_id",
+        "event_time",
+        "document",
+        "matched",
+    ],
     "late_events": [
         "event_id",
         "source_sequence",
@@ -61,11 +78,36 @@ class Savepoints:
         self.journal = journal
         self.artifacts = artifacts
 
+    def source_digest(self, connection, info):
+        plan = info["plan"]
+        if "join" in plan:
+            return fingerprint(
+                [
+                    self.journal.digest_prefix(
+                        connection, plan["join"][side + "_channel"], info["last_sequence"]
+                    )
+                    for side in ("left", "right")
+                ]
+            )
+        return self.journal.digest_prefix(
+            connection, info["channel"], info["last_sequence"]
+        )
+
+    def channel_layout(self, connection, info):
+        plan = info["plan"]
+        if "join" in plan:
+            return {
+                side: self.catalog.channel(
+                    plan["join"][side + "_channel"], connection
+                )["partitions"]
+                for side in ("left", "right")
+            }
+        return self.catalog.channel(info["channel"], connection)["partitions"]
+
     def create(self, pipeline, compressed=False):
         point_id = uuid.uuid4().hex
         with self.catalog.transaction() as connection:
             info = self.catalog.pipeline(pipeline, connection)
-            source = self.catalog.channel(info["channel"], connection)
             tables = {}
             for table, columns in STATE_TABLES.items():
                 order = "sequence" if table == "changes" else ",".join(columns)
@@ -77,10 +119,8 @@ class Savepoints:
                 "format_version": 1,
                 "point_id": point_id,
                 "pipeline": info,
-                "channel_partitions": source["partitions"],
-                "source_prefix_sha256": self.journal.digest_prefix(
-                    connection, info["channel"], info["last_sequence"]
-                ),
+                "channel_partitions": self.channel_layout(connection, info),
+                "source_prefix_sha256": self.source_digest(connection, info),
                 "state": tables,
             }
         artifact = self.artifacts.put_document(
@@ -170,6 +210,25 @@ class Savepoints:
                         json.loads(named[field])
         if total > 1000000:
             raise Invalid("savepoint row count exceeds limit")
+        if "join" in plan:
+            layout = document["channel_partitions"]
+            if not isinstance(layout, dict) or set(layout) != {"left", "right"}:
+                raise Invalid("savepoint join channel layout is invalid")
+            sides = {row[0]: row[1] for row in state["join_sides"]}
+            if sides != {
+                side: plan["join"][side + "_channel"] for side in ("left", "right")
+            }:
+                raise Invalid("savepoint join sides do not match the plan")
+            for side in ("left", "right"):
+                count = integer(layout[side], "channel partitions", 1, 128)
+                actual = sorted(
+                    row[1] for row in state["join_progress"] if row[0] == side
+                )
+                if actual != list(range(count)):
+                    raise Invalid("savepoint partition progress is incomplete")
+            if state["progress"]:
+                raise Invalid("join savepoint carries window progress rows")
+            return document
         partitions = integer(
             document["channel_partitions"], "channel partitions", 1, 128
         )
@@ -185,15 +244,10 @@ class Savepoints:
         if buckets is not None and buckets != info["buckets"]:
             raise Conflict("v1 savepoint cannot rescale keyed state")
         with self.catalog.transaction(True) as connection:
-            channel = self.catalog.channel(info["channel"], connection)
-            if channel["partitions"] != document["channel_partitions"]:
+            self.catalog.channel(info["channel"], connection)
+            if self.channel_layout(connection, info) != document["channel_partitions"]:
                 raise Conflict("savepoint source partition layout mismatch")
-            if (
-                self.journal.digest_prefix(
-                    connection, info["channel"], info["last_sequence"]
-                )
-                != document["source_prefix_sha256"]
-            ):
+            if self.source_digest(connection, info) != document["source_prefix_sha256"]:
                 raise Conflict("savepoint source prefix is unavailable or changed")
             if connection.execute(
                 "SELECT 1 FROM pipelines WHERE name=?", (destination,)

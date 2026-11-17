@@ -1,4 +1,4 @@
-from .values import Conflict, integer
+from .values import Conflict, Invalid, integer
 
 
 class Watermarks:
@@ -50,6 +50,10 @@ class Watermarks:
         integer(time_ms, "declared event time")
         with self.catalog.transaction(True) as connection:
             info = self.catalog.pipeline(pipeline, connection)
+            if "join" in info["plan"]:
+                raise Invalid(
+                    "join pipelines declare per-side progress through joins.declare"
+                )
             channel = self.catalog.channel(info["channel"], connection)
             integer(partition, "partition", 0, channel["partitions"] - 1)
             row = connection.execute(

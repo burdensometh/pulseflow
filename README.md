@@ -1,6 +1,6 @@
 # PulseFlow
 
-原创的事件时间流处理与实时 ETL 引擎，Python 3.11+ 标准库实现。主要数据链路是：分区事件日志 → 时态维度关联/表达式转换 → 有状态去重与序列匹配 → 事件时间窗口 → 版本化变更流 → 独立消费库与分层聚合。
+原创的事件时间流处理与实时 ETL 引擎，Python 3.11+ 标准库实现。主要数据链路是：分区事件日志 → 时态维度关联/表达式转换 → 有状态去重与序列匹配 → 事件时间窗口/双流区间关联 → 版本化变更流 → 独立消费库与分层聚合。
 
 本项目由当前对话原创实现，不声称来自第三方上游。与 CatalogSync 的来源抓取、DocWeave 的文档获取、SchemaLake 的批次文件快照不同，PulseFlow 的核心是源位点、事件时间、水位、窗口归属和计算状态恢复。它不实现看板、报表页面、CRUD 后台、权限系统或独立命令行工具。
 
@@ -29,6 +29,21 @@ app.engine.drain('windows')
 print(app.results.rows('windows'))
 ```
 
+双流区间关联（左外）示例：
+
+```python
+app.journal.create('left', 1)
+app.journal.create('right', 1)
+app.joins.create('pairs', 'left', 'right', {
+    'before_ms': 5000,   # 右事件最早可早于左事件 5 秒（含边界）
+    'after_ms': 10000,   # 右事件最晚可晚于左事件 10 秒（不含边界）
+    'outer': True,       # 左外关联：右侧水位证明无匹配后输出 right=None
+    'delay_ms': 1000,    # 两侧水位各自允许的乱序幅度
+})
+app.engine.drain('pairs')          # 同一 chunk 事务提交两侧进度、缓冲与结果
+print(app.joins.status('pairs'))   # 两侧水位、分区进度与待匹配缓冲
+```
+
 在 ECS 容器源码目录运行 `python3 -m unittest discover -s tests -v`。`pulseflow.service.serving(app)` 可启动仅监听环回地址的操作 API；HTTP 与 Python 服务使用相同数据链路。操作接口面向可信隔离环境，不提供公网权限管理。
 
 ## 明确的当前契约
@@ -42,13 +57,14 @@ print(app.results.rows('windows'))
 - Worker 使用租约与递增 fence；过期或被替代的 worker 不能提交。状态按 Adler32(key) mod buckets 分桶，当前 hash_version=1；分桶影响窗口与键状态的实际读写路径。
 - 维度按 valid_from 左闭区间解释，同一 valid_from 取最高 revision，删除版本阻止回退到更早值。事件在处理时按自己的事件时间关联维度。后来补发的历史维度更正不会自动重算已处理事件和已发布结果。
 - 去重基于事件时间 TTL，不更改源位点；null 去重字段不参与。最近值按 (event_time,event_id) 裁决。A→B 序列匹配使用每键最新 A，一次匹配消费该 A；它不是全重叠模式匹配器。
+- 双流 interval join 以 `{"join": {...}}` 计划创建独立管道，按键关联左右两条通道：右事件时间落在 `[左事件时间-before_ms, 左事件时间+after_ms)` 左闭右开区间即匹配，同一事件可匹配多条。每侧分区独立推进事件时间水位；任一侧事件时间严格小于本侧水位即存为 late 不参与关联。`outer=true` 时未匹配左事件等到右侧水位越过其区间右界（证明不会再有匹配）才输出 right=null 结果，不依赖墙钟。右侧状态在左水位超过 `事件时间+before_ms` 时回收（等于边界的仍可能匹配，予以保留），左侧状态在右水位到达 `事件时间+after_ms` 时定界清理。两侧进度、待匹配缓冲与结果在同一 chunk 事务提交，并随保存点一起恢复；重放与恢复不会重复配对。关联结果以 upsert 进入现有变更流供 Consumer/导出消费，processed/late 审计事件以 `left:`/`right:` 前缀区分两侧。
 - 结果按 key 保留单调 revision，变更流是 upsert/delete；独立 Consumer 将数据和 cursor 事务提交，并绑定真实源实例及计划身份。不可变 JSONL/CSV 导出保留当时结果。
 - Rollup 消费同一变更流，将已关闭窗口按 key-to-group 映射汇总；替换/删除输入会撤回旧贡献。当前每次从缓存输入重建汇总结果，且输出与 rollup cursor 在同一目录事务中提交。
-- v1 保存点保存真实分区进度、窗口、键状态、去重、late、结果及变更流，校验源前缀后恢复到同一 catalog 的新管道；允许压缩，不承诺跨不同日志 sequence 布局的目录直接恢复。不能改变 state buckets/hash 版本；现有算子状态表在保存点中显式列举。
+- v1 保存点保存真实分区进度、窗口、键状态、去重、join 两侧进度与待匹配缓冲、late、结果及变更流，校验源前缀后恢复到同一 catalog 的新管道；允许压缩，不承诺跨不同日志 sequence 布局的目录直接恢复。不能改变 state buckets/hash 版本；现有算子状态表在保存点中显式列举。
 - Replay 创建独立新管道，从同一源日志顺序完整处理，可比较结果和事件去向。它不提供活跃管道的新计划热切换、消费者别名切换或历史结果自动更新。
 - SQLiteIngress 使用只读源快照采集递增整数序列，将源前缀指纹、连接器水位与事件日志一并提交；已提交源前缀被修改会拒绝继续。Queries.series 对单键已接受事件提供前值保持/线性插值网格和精确时间积分，允许覆盖缺口，单独记录覆盖时长。
 - 文件摄取只接受完整 JSONL 行，保存前缀 hash 与字节/源位点；改写已摄取前缀被拒绝。冻结文件分块导入允许已成功前缀可见。Journal exchange 在受限原子批量内验证并导入完整分区前缀。
 
-当前没有 session window、双事件流 interval join、空闲分区自动排除、历史维度修订传播、状态重分桶迁移或通用算子插件生命周期。未来扩展需要以当前真实实现和可观察缺口为依据。
+当前没有 session window、空闲分区自动排除、历史维度修订传播、状态重分桶迁移或通用算子插件生命周期。未来扩展需要以当前真实实现和可观察缺口为依据。
 
 作者题面、设计卡、私有探针、轨迹及服务器凭据不属于本源码仓库。
