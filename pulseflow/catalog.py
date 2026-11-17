@@ -171,6 +171,51 @@ CREATE TABLE IF NOT EXISTS engine_runs (
  details TEXT NOT NULL,
  created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS partition_faults (
+ pipeline TEXT NOT NULL REFERENCES pipelines(name),
+ partition_id INTEGER NOT NULL,
+ source_offset INTEGER NOT NULL,
+ sequence INTEGER NOT NULL,
+ event_id TEXT NOT NULL,
+ event_time INTEGER NOT NULL,
+ reason TEXT NOT NULL,
+ document TEXT NOT NULL,
+ correction TEXT,
+ attempts INTEGER NOT NULL DEFAULT 0,
+ resolved INTEGER NOT NULL DEFAULT 0,
+ opened_at TEXT NOT NULL,
+ resolved_at TEXT,
+ PRIMARY KEY(pipeline,partition_id,source_offset)
+);
+CREATE INDEX IF NOT EXISTS partition_faults_active
+ ON partition_faults(pipeline,partition_id,resolved,source_offset);
+CREATE TABLE IF NOT EXISTS fault_repairs (
+ pipeline TEXT NOT NULL REFERENCES pipelines(name),
+ partition_id INTEGER NOT NULL,
+ source_offset INTEGER NOT NULL,
+ event_id TEXT NOT NULL,
+ attempt INTEGER NOT NULL,
+ outcome TEXT NOT NULL CHECK(outcome IN ('resolved','failed')),
+ correction TEXT,
+ reason TEXT,
+ created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fault_repairs_chain
+ ON fault_repairs(pipeline,partition_id,source_offset,attempt);
+CREATE TABLE IF NOT EXISTS held_events (
+ pipeline TEXT NOT NULL REFERENCES pipelines(name),
+ partition_id INTEGER NOT NULL,
+ source_offset INTEGER NOT NULL,
+ sequence INTEGER NOT NULL,
+ event_id TEXT NOT NULL,
+ event_time INTEGER NOT NULL,
+ reason TEXT NOT NULL,
+ document TEXT NOT NULL,
+ created_at TEXT NOT NULL,
+ PRIMARY KEY(pipeline,partition_id,source_offset)
+);
+CREATE INDEX IF NOT EXISTS held_events_partition
+ ON held_events(pipeline,partition_id,source_offset);
 CREATE TABLE IF NOT EXISTS saved_points (
  point_id TEXT PRIMARY KEY,
  pipeline TEXT NOT NULL,

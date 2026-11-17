@@ -52,7 +52,43 @@ STATE_TABLES = {
     ],
     "results": ["result_key", "revision", "document", "deleted"],
     "changes": ["result_key", "revision", "operation", "document"],
+    "partition_faults": [
+        "partition_id",
+        "source_offset",
+        "sequence",
+        "event_id",
+        "event_time",
+        "reason",
+        "document",
+        "correction",
+        "attempts",
+        "resolved",
+        "opened_at",
+        "resolved_at",
+    ],
+    "fault_repairs": [
+        "partition_id",
+        "source_offset",
+        "event_id",
+        "attempt",
+        "outcome",
+        "correction",
+        "reason",
+        "created_at",
+    ],
+    "held_events": [
+        "partition_id",
+        "source_offset",
+        "sequence",
+        "event_id",
+        "event_time",
+        "reason",
+        "document",
+        "created_at",
+    ],
 }
+
+OPTIONAL_STATE_TABLES = {"partition_faults", "fault_repairs", "held_events"}
 
 
 class Savepoints:
@@ -147,11 +183,16 @@ class Savepoints:
         integer(info["last_sequence"], "savepoint cursor", 0)
         integer(info["generation"], "savepoint generation", 0)
         state = document["state"]
-        if not isinstance(state, dict) or set(state) != set(STATE_TABLES):
+        if not isinstance(state, dict):
+            raise Invalid("savepoint state sections mismatch")
+        available = {key for key in state if key in STATE_TABLES}
+        missing = set(STATE_TABLES) - OPTIONAL_STATE_TABLES - available
+        unknown = set(state) - set(STATE_TABLES)
+        if missing or unknown:
             raise Invalid("savepoint state sections mismatch")
         total = 0
         for table, columns in STATE_TABLES.items():
-            rows = state[table]
+            rows = state.get(table, [])
             if not isinstance(rows, list):
                 raise Invalid("savepoint state must contain arrays")
             total += len(rows)
@@ -219,7 +260,11 @@ class Savepoints:
                 placeholders = ",".join("?" for _ in names)
                 sql = f'INSERT INTO {table}({",".join(names)}) VALUES ({placeholders})'
                 connection.executemany(
-                    sql, ([destination] + row for row in document["state"][table])
+                    sql,
+                    (
+                        [destination] + row
+                        for row in document["state"].get(table, [])
+                    ),
                 )
             self.catalog.event(
                 connection,

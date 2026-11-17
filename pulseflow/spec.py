@@ -43,6 +43,9 @@ def sequence_spec(value):
     }
 
 
+ERROR_MODES = {"rollback", "isolate"}
+
+
 def plan_spec(document):
     require_keys(
         document,
@@ -55,6 +58,7 @@ def plan_spec(document):
             "dimension",
             "sequence",
             "max_window_events",
+            "error_mode",
         ],
     )
     mapping = document.get("mapping", {})
@@ -71,6 +75,9 @@ def plan_spec(document):
     maximum = integer(
         document.get("max_window_events", 100000), "window event limit", 1, 1000000
     )
+    error_mode = document.get("error_mode", "rollback")
+    if error_mode not in ERROR_MODES:
+        raise Invalid("error mode must be rollback or isolate")
     result = {
         "window": window_spec(document["window"]),
         "mapping": mapping,
@@ -78,6 +85,8 @@ def plan_spec(document):
         "delay_ms": delay,
         "max_window_events": maximum,
     }
+    if error_mode != "rollback":
+        result["error_mode"] = error_mode
     if "dedup" in document:
         dedup = document["dedup"]
         require_keys(dedup, ["field", "ttl_ms"])

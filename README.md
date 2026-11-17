@@ -38,7 +38,8 @@ print(app.results.rows('windows'))
 - 窗口是左闭右开区间；支持 tumbling 与任意合法 slide 的 hopping，可带网格偏移。统计含行数/非空数、精确和/均值、极值、nearest-rank p50/p95 和精确 distinct。均值四舍五入到 12 位小数。
 - 分区最大事件时间或显式声明的时间减 delay，再对所有源分区取最小值；未见任何事件且未声明的分区阻止水位前进。全局水位单向推进；事件时间严格小于当前水位的记录保存为 late，不再更新窗口。等于水位仍可接收。
 - 当窗口右边界不大于水位时发布结果。当前实现保留完整窗口事件，关闭时读入内存计算，受 max_window_events 限制；没有磁盘溢写统计或窗口状态自动回收。
-- 处理顺序使用持久源日志的 sequence，每个 chunk 的源进度、算子状态、水位、结果和变更流一起提交。任一转换错误使整个 chunk 回滚；当前不支持按故障分区隔离，也没有自动修复事件。
+- 处理顺序使用持久源日志的 sequence，每个 chunk 的源进度、算子状态、水位、结果和变更流一起提交。算子异常默认使整个 chunk 回滚（`error_mode=rollback`，原有行为）；也可在计划中声明 `error_mode=isolate` 启用分区隔离模式。隔离模式下故障记录及其原因持久写入 `partition_faults`，该分区后续记录持久进入 `held_events` 而不越过故障位点；其他分区继续正常处理，已成功结果不回退。
+- 隔离模式支持原位修正：`engine.repair(pipeline, partition, offset, correction)` 只允许修改 `value/key/kind/attrs`（可用 `attrs.<name>` 精确覆盖某个属性），不能改写 `id/time` 或原始源记录；修正后从故障位点重算该记录，并按源位点顺序继续放行该分区的 held 记录。每次修正/重试作为一次 attempt 持久写入 `fault_repairs`（成功或失败均保留），重启或保存点恢复后继续同一修复链；已解决故障再次修正会被拒绝，因而成功记录不会被重复贡献。未解决故障所在分区把水位候选压到故障事件时间，`declare` 也不能越过它。整块回滚模式仍可显式选择。
 - Worker 使用租约与递增 fence；过期或被替代的 worker 不能提交。状态按 Adler32(key) mod buckets 分桶，当前 hash_version=1；分桶影响窗口与键状态的实际读写路径。
 - 维度按 valid_from 左闭区间解释，同一 valid_from 取最高 revision，删除版本阻止回退到更早值。事件在处理时按自己的事件时间关联维度。后来补发的历史维度更正不会自动重算已处理事件和已发布结果。
 - 去重基于事件时间 TTL，不更改源位点；null 去重字段不参与。最近值按 (event_time,event_id) 裁决。A→B 序列匹配使用每键最新 A，一次匹配消费该 A；它不是全重叠模式匹配器。

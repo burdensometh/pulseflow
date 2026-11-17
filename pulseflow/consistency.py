@@ -60,25 +60,54 @@ class Consistency:
                 (info["name"],),
             )
         )
-        maximum = max((row["source_sequence"] for row in seen), default=0)
+        faults = list(
+            connection.execute(
+                "SELECT * FROM partition_faults WHERE pipeline=? AND resolved=0",
+                (info["name"],),
+            )
+        )
+        held = list(
+            connection.execute(
+                "SELECT * FROM held_events WHERE pipeline=?", (info["name"],)
+            )
+        )
+        covered_sequences = [row["source_sequence"] for row in seen]
+        covered_sequences += [row["sequence"] for row in faults]
+        covered_sequences += [row["sequence"] for row in held]
+        maximum = max(covered_sequences, default=0)
         if maximum != info["last_sequence"]:
             problems.append("pipeline cursor does not match processed prefix")
         expected_count = connection.execute(
             "SELECT count(*) FROM journal WHERE channel=? AND sequence<=?",
             (info["channel"], info["last_sequence"]),
         ).fetchone()[0]
-        if expected_count != len(seen):
+        if expected_count != len(covered_sequences):
             problems.append("processed event prefix is incomplete")
+        if len(set(covered_sequences)) != len(covered_sequences):
+            problems.append("a source record is accounted for more than once")
+        per_partition = {}
+        for row in seen:
+            per_partition.setdefault(row["partition_id"], []).append(
+                row["source_offset"]
+            )
         for progress in connection.execute(
             "SELECT * FROM progress WHERE pipeline=?", (info["name"],)
         ):
-            offsets = [
-                row["source_offset"]
-                for row in seen
-                if row["partition_id"] == progress["partition_id"]
-            ]
+            offsets = sorted(per_partition.get(progress["partition_id"], []))
             if offsets != list(range(progress["next_offset"])):
                 problems.append("processed partition offsets do not match progress")
+        for fault in faults:
+            if connection.execute(
+                "SELECT 1 FROM processed_events WHERE pipeline=? AND event_id=?",
+                (info["name"], fault["event_id"]),
+            ).fetchone():
+                problems.append("unresolved fault already has a processed event")
+        for row in held:
+            if connection.execute(
+                "SELECT 1 FROM processed_events WHERE pipeline=? AND event_id=?",
+                (info["name"], row["event_id"]),
+            ).fetchone():
+                problems.append("held event was also processed: " + row["event_id"])
 
     def check_membership(self, connection, info, problems):
         actual = {}
@@ -106,6 +135,15 @@ class Consistency:
                 info["watermark"] is None or row["window_end"] > info["watermark"]
             ):
                 problems.append("window closed ahead of watermark")
+        for fault in connection.execute(
+            "SELECT * FROM partition_faults WHERE pipeline=? AND resolved=0",
+            (info["name"],),
+        ):
+            if (
+                info["watermark"] is not None
+                and fault["event_time"] < info["watermark"]
+            ):
+                problems.append("watermark advanced past an unresolved partition fault")
 
     def check_results(self, connection, info, problems):
         for row in connection.execute(

@@ -83,6 +83,10 @@ class API:
             return app.results.replace_visible(
                 name, body["expected_head"], body["documents"]
             )
+        if action == "repair":
+            return app.engine.repair(
+                name, body["partition"], body["offset"], body.get("correction")
+            )
         raise Missing("pipeline operation does not exist")
 
     def get(self, parts, query):
@@ -113,6 +117,18 @@ class API:
                 )
             if action == "late":
                 return app.engine.late(name)
+            if action == "faults":
+                return app.engine.faults(
+                    name, query.get("resolved", ["0"])[0] == "1"
+                )
+            if action == "held":
+                return app.engine.held_events(name)
+            if action == "repairs":
+                return app.engine.repairs(
+                    name,
+                    query_integer(query, "partition"),
+                    query_integer(query, "offset"),
+                )
             if action == "watermark":
                 return app.watermarks.status(name)
             if action == "windows":

@@ -34,11 +34,28 @@ class Queries:
                 "SELECT watermark FROM late_events WHERE pipeline=? AND event_id=?",
                 (pipeline, event_id),
             ).fetchone()
+            fault = connection.execute(
+                "SELECT * FROM partition_faults WHERE pipeline=? AND event_id=?",
+                (pipeline, event_id),
+            ).fetchone()
+            held = connection.execute(
+                "SELECT * FROM held_events WHERE pipeline=? AND event_id=?",
+                (pipeline, event_id),
+            ).fetchone()
             return {
                 "source": {**dict(source), "document": json.loads(source["document"])},
                 "processed": dict(processed) if processed else None,
                 "windows": memberships,
                 "rejection_watermark": late[0] if late else None,
+                "fault": (
+                    {
+                        **dict(fault),
+                        "resolved": bool(fault["resolved"]),
+                    }
+                    if fault
+                    else None
+                ),
+                "held": dict(held) if held else None,
             }
 
     def accepted(self, pipeline, key=None):
